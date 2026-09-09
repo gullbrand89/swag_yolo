@@ -1,0 +1,6 @@
+# kärna
+numpy>=1.24
+torch>=2.1          # scaled_dot_product_attention används i RoPE-encodern
+
+# bara inspect_label.py (plotly-paneler för notebook)
+plotly>=5.18

@@ -1,0 +1,1 @@
+python -c "import torch; print(torch.__version__, torch.cuda.get_device_name(0)); print(torch.cuda.get_arch_list()); print((torch.randn(1000,1000,device='cuda') @ torch.randn(1000,1000,device='cuda')).sum().item())"

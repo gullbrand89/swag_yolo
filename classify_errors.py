@@ -34,7 +34,7 @@ from collections import Counter
 from pathlib import Path
 
 from config import cfg
-from labels import parse, split_visits
+from labels import parse
 from vocab import bin_of
 
 
@@ -52,9 +52,17 @@ def read_preds(path):
 
 
 def _post(tokens):
+    """
+    Posten utan ett eventuellt scratchpad-block. Definierad här i stället för
+    importerad, så att skriptet fungerar oavsett om scratchpaden finns i projektet.
+    Utan VISITS-prefix är den en ren genomsläppning.
+    """
+    tokens = list(tokens)
+    if not tokens or tokens[0] != "VISITS":
+        return tokens
     try:
-        return split_visits(tokens)[1]
-    except ValueError:
+        return tokens[tokens.index("ENDVISITS") + 1:]
+    except ValueError:                 # VISITS utan ENDVISITS, trasig utdata
         return tokens
 
 

@@ -49,11 +49,12 @@ def run_length(bins, flags=None):
 
 
 def make_channels(pri_obs):
-    """
-    Vektoriserad binning av en observerad PRI-sekvens.
-    Identisk med den gamla loopversionen men ~29x snabbare.
-    """
     p = np.asarray(pri_obs, dtype=float)
+    if p.ndim != 1:
+        raise ValueError(
+            f"make_channels väntade EN pulsföljd (1-D), fick shape {p.shape}. "
+            f"Skickas hela listan med signaler in i stället för en enskild?")
+
     x = (np.clip(p, cfg.in_min, cfg.in_max) - cfg.in_min) / (cfg.in_max - cfg.in_min)
 
     bins = np.clip((x * (cfg.in_bins - 2)).astype(np.int64), 0, cfg.in_bins - 2)

@@ -1,11 +1,9 @@
 import numpy as np
-from vocab import in_bin_of, in_cont_of
-from data import make_channels
 from config import cfg
+from data import create_emitter_data
 
-p = np.concatenate([np.geomspace(1, 999, 500), [1000, 1500, 5000]])
-ch = make_channels(p)
-assert (ch["bins"] == [in_bin_of(x) for x in p]).all(), "data.py och vocab.py är osams"
-assert np.allclose(ch["cont"], [in_cont_of(x) for x in p], atol=1e-6)
-print("binningen är konsekvent")
-print(f"overflow: {(ch['bins'] == cfg.in_bins - 1).mean():.2%} av testpulserna")
+for n in (1, cfg.samples_per_emitter):
+    seqs, lab = create_emitter_data(1, n, 0.0, cfg.noise_level, np.random.default_rng(0))[0]
+    print(f"n_signals={n}: typ {type(seqs).__name__}, "
+          f"{'ndim ' + str(np.ndim(seqs)) if isinstance(seqs, np.ndarray) else 'len ' + str(len(seqs))}, "
+          f"första elementet har ndim {np.ndim(seqs[0])}")

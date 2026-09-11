@@ -76,17 +76,28 @@ def make_channels(pri_obs):
 _CHANNELS = ("bins", "cont", "toa", "rl", "flag")
 
 
-# ---------------- par
-def make_pairs(rng, n_emitters=1, p_drop=None, **kw):
-    if p_drop is None:
-        p_drop = rng.uniform(0, cfg.p_drop) if cfg.randomize_p_drop else cfg.p_drop
-    data = create_emitter_data(n_emitters, cfg.n_pulses, p_drop, cfg.noise_level, rng, **kw)
-    out = []
-    for pri, label in data:                      # en sekvens per emitter, inte en lista
-        pri = np.asarray(pri, dtype=float)
-        out.append((make_channels(pri), label_to_tokens(label, pri=pri)))
-    return out
+def as_signals(seqs):
+    """
+    Normalisera till en lista med 1-D-pulsföljder. Generatorer skiljer sig här:
+    lista med arrayer, 2-D-array (n_signals, n_pulser), eller en naken 1-D-array
+    när n_signals == 1.
+    """
+    if isinstance(seqs, (list, tuple)):
+        return [np.asarray(s, dtype=float) for s in seqs]
+    a = np.asarray(seqs, dtype=float)
+    return [a] if a.ndim == 1 else [row for row in a]
 
+
+def make_pairs(rng, n_emitters=1, p_drop=None, **kw):
+    """-> lista av (channels, tokens), en post per signal."""
+    data = create_emitter_data(n_emitters, cfg.samples_per_emitter, p_drop,
+                               cfg.noise_level, rng, **kw)
+    out = []
+    for seqs, label in data:
+        tokens = label_to_tokens(label)
+        for s in as_signals(seqs):          # en signal i taget, aldrig hela arrayen
+            out.append((make_channels(s), tokens))
+    return out
 
 class StreamDataset(Dataset):
     """

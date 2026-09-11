@@ -165,6 +165,21 @@ def bands(level_sets, n_bands=5, coverage=0.99):
         print("     binningarna ger dig något gratis.")
 
 
+def as_sequences(seqs):
+    """
+    Normalisera det generatorn lämnar till en lista med 1-D-arrayer.
+
+    Generatorer skiljer sig här: vissa ger en lista med arrayer, vissa en 2-D-array
+    (n_signals, n_pulser), och vissa en naken 1-D-array när n_signals == 1. Den sista
+    är lömsk -- itererar man över den får man enskilda tal i stället för sekvenser.
+    """
+    if isinstance(seqs, np.ndarray):
+        return [seqs.astype(float)] if seqs.ndim == 1 else [r.astype(float) for r in seqs]
+    if len(seqs) and np.ndim(seqs[0]) == 0:          # lista med tal = EN sekvens
+        return [np.asarray(seqs, dtype=float)]
+    return [np.asarray(s, dtype=float) for s in seqs]
+
+
 def pulses(data, n_max=400):
     """
     Mät de värden som beror på SIGNALEN, inte på facitet: toa_scale, run_tol_bins
@@ -172,9 +187,10 @@ def pulses(data, n_max=400):
     """
     pri_all, resid = [], []
     for seqs, lab in data[:n_max]:
-        lv = np.unique(np.asarray(lab["levels"], dtype=float))
-        for s in seqs:
-            p = np.asarray(s, dtype=float)
+        lv = np.unique(np.asarray(lab["levels"], dtype=float).ravel())
+        for p in as_sequences(seqs):
+            if p.size == 0:
+                continue
             pri_all.append(p)
             # avstånd till närmaste nivå i facitet
             resid.append(np.abs(p[:, None] - lv[None, :]).min(1))

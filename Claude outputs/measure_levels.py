@@ -165,6 +165,60 @@ def bands(level_sets, n_bands=5, coverage=0.99):
         print("     binningarna ger dig något gratis.")
 
 
+def pulses(data, n_max=400):
+    """
+    Mät de värden som beror på SIGNALEN, inte på facitet: toa_scale, run_tol_bins
+    och hur stor del av pulserna som hamnar i overflow-binen.
+    """
+    pri_all, resid = [], []
+    for seqs, lab in data[:n_max]:
+        lv = np.unique(np.asarray(lab["levels"], dtype=float))
+        for s in seqs:
+            p = np.asarray(s, dtype=float)
+            pri_all.append(p)
+            # avstånd till närmaste nivå i facitet
+            resid.append(np.abs(p[:, None] - lv[None, :]).min(1))
+    if not pri_all:
+        return
+    p = np.concatenate(pri_all)
+    r = np.concatenate(resid)
+
+    print(f"\npulser      {p.size} st ur {min(len(data), n_max)} emittrar, "
+          f"{p.min():.4f} – {p.max():.4f} µs")
+
+    # ---- toa_scale: en positionsenhet bör motsvara ungefär en puls, så att
+    # RoPE:ns tidshalva arbetar på samma skala som indexhalvan
+    print(f"\ntoa_scale   medel-PRI = {p.mean():.2f} µs   median = "
+          f"{np.median(p):.2f} µs")
+    print(f"            -> toa_scale: float = {p.mean():.0f}"
+          f"   (nuvarande {cfg.toa_scale:g})")
+    span = p.sum() / len(pri_all) / p.mean()
+    print(f"            en signal spänner då ~{span:.0f} positionsenheter "
+          f"över {len(pri_all[0])} pulser")
+
+    # ---- jitter: hur långt från sin nivå ligger en puls?
+    w = (cfg.in_max - cfg.in_min) / (cfg.in_bins - 2)
+    print(f"\njitter      avstånd från puls till närmaste nivå i facitet:")
+    for q in (50, 90, 95, 99):
+        print(f"              {q}:e percentilen   {np.percentile(r, q):>9.4f} µs"
+              f"   = {np.percentile(r, q)/w:>6.1f} inputbins")
+    print(f"            svansen är bortfall (ihopslagna intervall), inte jitter --")
+    print(f"            läs av på 95:e percentilen, inte 99:e")
+    print(f"            -> run_tol_bins: int = "
+          f"{max(1, math.ceil(np.percentile(r, 95) / w))}"
+          f"   (nuvarande {cfg.run_tol_bins})")
+
+    # ---- overflow
+    over = (p >= cfg.in_max).mean()
+    under = (p < cfg.in_min).mean()
+    print(f"\noverflow    cfg.in_min = {cfg.in_min:g}, cfg.in_max = {cfg.in_max:g}")
+    print(f"            {over:.2%} av pulserna >= in_max (hamnar i overflow-binen)")
+    if under:
+        print(f"            {under:.2%} under in_min -- klipps till bin 0")
+    return dict(mean_pri=float(p.mean()), jitter95=float(np.percentile(r, 95)),
+                overflow=float(over))
+
+
 def levels_of(data):
     return [lab["levels"] for _, lab in data]
 
@@ -184,10 +238,12 @@ def main():
     rng = np.random.default_rng(args.seed)
     print(f"generator: {cfg.emitter}   {args.n} emittrar\n")
 
-    # n_signals=1: nivåerna sitter i etiketten, signalerna behövs inte
+    # n_signals=1 räcker: nivåerna sitter i etiketten, och pulses() behöver
+    # bara en signal per emitter för att mäta jitter och medel-PRI
     data = create_emitter_data(args.n, 1, 0.0, cfg.noise_level, rng)
     report(levels_of(data), args.coverage, args.margin)
     bands(levels_of(data), args.bands, args.coverage)
+    pulses(data)
 
     if args.variants:
         try:

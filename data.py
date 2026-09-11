@@ -54,8 +54,7 @@ def make_channels(pri_obs):
     Identisk med den gamla loopversionen men ~29x snabbare.
     """
     p = np.asarray(pri_obs, dtype=float)
-    lo, hi = np.log(cfg.in_min), np.log(cfg.in_max)
-    x = (np.log(np.clip(p, cfg.in_min, cfg.in_max)) - lo) / (hi - lo)
+    x = (np.clip(p, cfg.in_min, cfg.in_max) - cfg.in_min) / (cfg.in_max - cfg.in_min)
 
     bins = np.clip((x * (cfg.in_bins - 2)).astype(np.int64), 0, cfg.in_bins - 2)
     bins[p >= cfg.in_max] = cfg.in_bins - 1            # overflow-bin

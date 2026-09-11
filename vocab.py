@@ -30,13 +30,11 @@ def pri_of_bin(b):
 def in_bin_of(pri):
     if pri >= cfg.in_max:
         return cfg.in_bins - 1
-    lo, hi = math.log(cfg.in_min), math.log(cfg.in_max)
-    b = int((math.log(max(pri, cfg.in_min)) - lo) / (hi - lo) * (cfg.in_bins - 2))
-    return max(0, min(cfg.in_bins - 2, b))
+    x = (max(pri, cfg.in_min) - cfg.in_min) / (cfg.in_max - cfg.in_min)
+    return max(0, min(cfg.in_bins - 2, int(x * (cfg.in_bins - 2))))
 
 def in_cont_of(pri):
-    lo, hi = math.log(cfg.in_min), math.log(cfg.in_max)
-    x = (math.log(min(max(pri, cfg.in_min), cfg.in_max)) - lo) / (hi - lo)
+    x = (min(max(pri, cfg.in_min), cfg.in_max) - cfg.in_min) / (cfg.in_max - cfg.in_min)
     return x * 2 - 1
 
 

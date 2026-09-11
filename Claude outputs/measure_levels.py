@@ -119,6 +119,52 @@ def report(level_sets, coverage=0.99, margin=2.0, cfg_range=None,
                 d_rel=d_rel, d_abs=d_abs, clipped=under + over)
 
 
+def bands(level_sets, n_bands=5, coverage=0.99):
+    """
+    Är avstånden RELATIVA eller ABSOLUTA? Det avgör vilken binning som är rätt, och
+    det syns bara om man delar upp på PRI -- ett aggregat över hela korpusen döljer det.
+
+      relativa kolumnen ungefär konstant  -> logaritmisk binning
+      absoluta kolumnen ungefär konstant  -> linjär binning
+
+    Är ingen av dem konstant måste n_bins sättas efter det värsta bandet, och då
+    hjälper ingen av binningarna särskilt mycket.
+    """
+    sets = [np.unique(np.asarray(s, dtype=float)) for s in level_sets if len(s) > 1]
+    if not sets:
+        return
+    pri = np.concatenate([s[:-1] for s in sets])        # den lägre nivån i varje par
+    sep = np.concatenate([np.diff(s) for s in sets])
+    q = (1.0 - coverage) * 100
+
+    edges = np.geomspace(pri.min(), pri.max() * 1.001, n_bands + 1)
+    print(f"\navstånd per PRI-band ({coverage:.0%}-percentil inom bandet):")
+    print(f"  {'band (µs)':<22} {'n':>7} {'absolut (µs)':>14} {'relativt (%)':>14}")
+    rows = []
+    for a, b in zip(edges[:-1], edges[1:]):
+        m = (pri >= a) & (pri < b)
+        if m.sum() < 20:
+            continue
+        A = np.percentile(sep[m], q)
+        R = np.percentile(sep[m] / pri[m], q) * 100
+        rows.append((A, R))
+        print(f"  {a:>9.3g} – {b:<9.3g} {m.sum():>7} {A:>14.4f} {R:>14.4f}")
+
+    if len(rows) < 2:
+        return
+    A = np.array([r[0] for r in rows]); R = np.array([r[1] for r in rows])
+    spread = lambda x: x.max() / max(x.min(), 1e-12)
+    sa, sr = spread(A), spread(R)
+    print(f"\n  spridning över banden:  absolut {sa:.1f}x   relativt {sr:.1f}x")
+    if sr < sa / 2:
+        print("  -> avstånden är RELATIVA. Logaritmisk binning.")
+    elif sa < sr / 2:
+        print("  -> avstånden är ABSOLUTA. Linjär binning.")
+    else:
+        print("  -> varken eller. Sätt n_bins efter det värsta bandet; ingen av")
+        print("     binningarna ger dig något gratis.")
+
+
 def levels_of(data):
     return [lab["levels"] for _, lab in data]
 
@@ -129,6 +175,8 @@ def main():
     ap.add_argument("--coverage", type=float, default=0.99)
     ap.add_argument("--margin", type=float, default=2.0)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--bands", type=int, default=5,
+                    help="antal PRI-band i relativ/absolut-testet")
     ap.add_argument("--variants", action="store_true",
                     help="dela upp per mönstervariant (kräver all_emitters)")
     args = ap.parse_args()
@@ -139,6 +187,7 @@ def main():
     # n_signals=1: nivåerna sitter i etiketten, signalerna behövs inte
     data = create_emitter_data(args.n, 1, 0.0, cfg.noise_level, rng)
     report(levels_of(data), args.coverage, args.margin)
+    bands(levels_of(data), args.bands, args.coverage)
 
     if args.variants:
         try:

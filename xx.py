@@ -23,3 +23,20 @@ if hasattr(s, "keys"):
 elif hasattr(s, "__dict__"):
     print("attribut:", list(vars(s))[:20])
 print("\nlabel:", {k: (type(v).__name__, np.shape(v)) for k, v in lab.items()})
+
+
+
+import numpy as np
+from config import cfg
+from data import create_emitter_data
+
+d = create_emitter_data(2, 3, 0.0, cfg.noise_level, np.random.default_rng(0))   # 2 emittrar, 3 signaler
+
+print("returen        :", type(d).__name__, "len", len(d))
+e = d[0]
+print("d[0]           :", type(e).__name__, "len", len(e) if hasattr(e, "__len__") else "-")
+for i, part in enumerate(e):
+    print(f"  d[0][{i}]      : {type(part).__name__}, shape {np.shape(part)}")
+    if isinstance(part, (list, tuple, np.ndarray)) and len(part):
+        print(f"                 första elementet: {type(part[0]).__name__}, "
+              f"shape {np.shape(part[0])}, värde {np.ravel(part[0])[:3]}")

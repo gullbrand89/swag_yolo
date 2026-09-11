@@ -77,15 +77,13 @@ _CHANNELS = ("bins", "cont", "toa", "rl", "flag")
 
 # ---------------- par
 def make_pairs(rng, n_emitters=1, p_drop=None, **kw):
-    """-> lista av (channels, tokens), n_emitters * samples_per_emitter stycken."""
     if p_drop is None:
         p_drop = rng.uniform(0, cfg.p_drop) if cfg.randomize_p_drop else cfg.p_drop
-    data = create_emitter_data(n_emitters, cfg.samples_per_emitter, p_drop, cfg.noise_level,
-                               rng, **kw)
+    data = create_emitter_data(n_emitters, cfg.n_pulses, p_drop, cfg.noise_level, rng, **kw)
     out = []
-    for seqs, label in data:
-        tokens = label_to_tokens(label)
-        out.extend((make_channels(s), tokens) for s in seqs)
+    for pri, label in data:                      # en sekvens per emitter, inte en lista
+        pri = np.asarray(pri, dtype=float)
+        out.append((make_channels(pri), label_to_tokens(label, pri=pri)))
     return out
 
 

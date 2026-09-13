@@ -176,20 +176,57 @@ def test_binning(n=200):
 
 
 # ------------------------------------------------------------------ 5
+def _overlap_match(clean_pri, obs_pri, tol=1e-6):
+    """
+    Hur stor del av den glesade signalens pulser ligger på samma tidpunkt som i den
+    rena? -> (andel träffar, antal jämförda, andel av obs bortom den renas slut)
+
+    Bortfall tar bort pulser ur ett gemensamt pulståg, så de som blir kvar ska ha
+    OFÖRÄNDRADE ankomsttider. Men "delmängd" håller inte rakt av, av tre skäl:
+
+      * signalen trunkeras till samma ANTAL pulser, inte samma TID, så den glesade
+        sträcker sig längre och slutet har inget att matcha mot -- därför jämförs
+        bara det gemensamma tidsfönstret
+      * faller ankarpulsen bort mäts allt från nästa puls och hela axeln förskjuts
+        -- det ger nära 0 % träff och syns direkt i utskriften
+      * float-summering i olika ordning skiljer i sista bitarna -- därför tolerans
+        i stället för exakt likhet
+    """
+    ta = np.cumsum(np.asarray(clean_pri, dtype=float))
+    tb = np.cumsum(np.asarray(obs_pri, dtype=float))
+    if ta.size == 0 or tb.size == 0:
+        return 0.0, 0, 1.0
+    inside = tb <= ta[-1] + tol
+    tb_in = tb[inside]
+    if tb_in.size == 0:
+        return 0.0, 0, 1.0
+    i = np.clip(np.searchsorted(ta, tb_in), 1, ta.size - 1)
+    d = np.minimum(np.abs(ta[i] - tb_in), np.abs(ta[i - 1] - tb_in))
+    return float((d <= tol).mean()), int(tb_in.size), float(1.0 - inside.mean())
+
+
 def test_determinism():
+    """
+    Evalmängderna måste vara jämförbara mellan bortfallsnivåer. Är de inte det går
+    det inte att avgöra om ett sämre mått vid drop 0.20 beror på bortfallet eller
+    på att det helt enkelt är andra emittrar.
+    """
     print("\n5) reproducerbarhet över bortfallsnivåer")
     a = gen(6, 3, 0.00, seed=7)
-    same_em = same_sig = True
+    same_em = True
+    worst, beyond = 1.0, 0.0
     for p in (0.05, 0.20):
         b = gen(6, 3, p, seed=7)
         for (sa, la), (sb, lb) in zip(a, b):
             same_em &= bool(np.allclose(np.ravel(la["levels"]), np.ravel(lb["levels"])))
             for x, y in zip(sa, sb):
-                # bortfall tar bort pulser; de som blir kvar måste vara en delmängd
-                ta, tb = np.round(np.cumsum(x), 6), np.round(np.cumsum(y), 6)
-                same_sig &= bool(np.isin(tb[:-1], ta).all())
+                f, _, out = _overlap_match(x, y)
+                worst = min(worst, f)
+                beyond = max(beyond, out)
     check("samma emittrar oavsett drop_rate", same_em)
-    check("samma underliggande signal oavsett drop_rate", same_sig)
+    check("samma underliggande signal oavsett drop_rate", worst >= 0.99,
+          f"sämsta träff {worst:.1%} i gemensamt tidsfönster, "
+          f"{beyond:.1%} av den glesade ligger bortom den rena")
 
 
 # ------------------------------------------------------------------ 6

@@ -56,6 +56,8 @@ def to_tokens(levels, lengths, order_fixed, length_fixed, compress_lengths=None)
         nivå <-> längd bevaras
       * ett nollbrett intervall skrivs om till en fast dwell: length_fixed=False
         med min == max blir DWELL FIXED
+      * med en eller två nivåer är ordningen inte observerbar och skrivs alltid som
+        ORDER FIXED -- se kommentaren vid forced_order
     """
     if compress_lengths is None:
         compress_lengths = getattr(cfg, "compress_lengths", True)
@@ -86,6 +88,17 @@ def to_tokens(levels, lengths, order_fixed, length_fixed, compress_lengths=None)
     name = {b: LEVEL_NAMES[i] for i, b in enumerate(uniq)}
     seq = [name[b] for b in bins]
 
+    # ---- kanonisering: ordningen är inte observerbar med färre än tre nivåer
+    # Med EN nivå sker inga byten alls. Med TVÅ nivåer alternerar den observerade
+    # följden alltid -- en omedelbar upprepning smälter ihop med föregående besök och
+    # syns inte i signalen, så en slumpad ordning ger exakt samma pulsföljd som
+    # cykeln [L0, L1]. ORDER RANDOM och ORDER FIXED beskriver då samma emitter, och
+    # utan den här regeln får identiska signaler två olika facit.
+    forced_order = not order_fixed and len(uniq) <= 2
+    if forced_order:
+        order_fixed = True
+        seq = [name[b] for b in uniq]
+
     t = ["LEVELS", f"N{len(uniq)}"]
     for b in uniq:
         t += [name[b], f"N{b}"]
@@ -96,7 +109,10 @@ def to_tokens(levels, lengths, order_fixed, length_fixed, compress_lengths=None)
 
     # ---- ordning + längder
     if order_fixed:
-        if length_fixed and len(len_min) == len(seq_min):
+        # forced_order: ordningen är påtvingad av kanoniseringen ovan, inte uppgiven av
+        # generatorn. Då finns ingen känd koppling nivå <-> längd att bevara, och att
+        # rotera ihop dem skulle hitta på en.
+        if length_fixed and not forced_order and len(len_min) == len(seq_min):
             # samma period: rotera ihop så att kopplingen bevaras
             pairs = _rot(list(zip(seq_min, len_min)))
             seq_out = [p[0] for p in pairs]

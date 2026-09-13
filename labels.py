@@ -7,6 +7,10 @@ Format (nivå- och längdcykel som separata block, oberoende perioder):
   DWELL  FIXED N10 N5     |  DWELL RANGE N5 N12   (min, max)
   END
 Längd: N<k> pulser eller INF (static).
+
+RANGE används bara när intervallet har bredd. Ett nollbrett intervall beskriver samma
+emitter som en fast dwell och normaliseras till DWELL FIXED, så att en emitter aldrig
+kan ha två giltiga facit.
 """
 from config import cfg
 from vocab import LEVEL_NAMES, TOK2ID, bin_of, pri_of_bin
@@ -50,12 +54,26 @@ def to_tokens(levels, lengths, order_fixed, length_fixed, compress_lengths=None)
       * varje cykel roteras till sin minsta rotation
       * har cyklerna samma period roteras de TILLSAMMANS, så att kopplingen
         nivå <-> längd bevaras
+      * ett nollbrett intervall skrivs om till en fast dwell: length_fixed=False
+        med min == max blir DWELL FIXED
     """
     if compress_lengths is None:
         compress_lengths = getattr(cfg, "compress_lengths", True)
 
     levels = list(levels)
     lengths = [None if x is None else int(x) for x in lengths]
+
+    # ---- kanonisering: ett nollbrett intervall ÄR en fast dwell
+    # Utan den här regeln har samma emitter två giltiga facit -- DWELL RANGE N2 N2
+    # och DWELL FIXED N2 -- och då ser modellen identiska signaler med olika mål.
+    # Det blir ett golv i lossen som ingen träning tar bort.
+    # Villkoret None not in lengths är inte kosmetiskt: None betyder INF, alltså en
+    # nivå som aldrig lämnas, och den informationen får inte tyst filtreras bort.
+    if not length_fixed and lengths and None not in lengths:
+        if min(lengths) == max(lengths):
+            length_fixed = True
+            if compress_lengths:
+                lengths = [lengths[0]]
 
     # ---- nivådefinitioner
     bins = [bin_of(v) for v in levels]
@@ -95,9 +113,13 @@ def to_tokens(levels, lengths, order_fixed, length_fixed, compress_lengths=None)
             len_out = _rot(len_min)
         t += ["DWELL", "FIXED"] + [_L(n) for n in len_out]
     else:
-        vals = [n for n in lengths if n is not None]
-        lo, hi = (min(vals), max(vals)) if vals else (0, 0)
-        t += ["DWELL", "RANGE", f"N{lo}", f"N{hi}"]
+        # Den gamla koden filtrerade bort None här och gav "N0 N0" om allt var None.
+        # Båda är tyst informationsförlust: INF betyder "lämnar aldrig nivån" och går
+        # inte att uttrycka som ett intervall, så ett RANGE med INF är ett
+        # självmotsägande facit. Bättre att smälla än att skicka nonsens till modellen.
+        assert lengths, "DWELL RANGE utan längder"
+        assert None not in lengths, f"DWELL RANGE kan inte innehålla INF: {lengths}"
+        t += ["DWELL", "RANGE", f"N{min(lengths)}", f"N{max(lengths)}"]
 
     t += ["END"]
 

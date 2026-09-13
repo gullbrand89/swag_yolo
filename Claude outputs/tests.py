@@ -9,11 +9,12 @@ fel som annars kostar en hel körning innan de märks:
   0. generatorn håller kontraktet  -- oavsett vilken modul cfg.emitter pekar på
   1. facitet överlever rundturen to_tokens -> parse -> to_tokens
   2. facitet beskriver faktiskt sin egen signal (verify)
-  3. binningen är konsekvent mellan vocab.py och data.py, och täcker datan
-  4. samma seed ger samma emittrar OCH samma signaler för alla bortfallsnivåer
-  5. en batch går genom modell, loss och avkodning och ger ändliga tal (kräver torch)
+  3. en emitter har exakt ETT facit -- likvärdiga beskrivningar kanoniseras lika
+  4. binningen är konsekvent mellan vocab.py och data.py, och täcker datan
+  5. samma seed ger samma emittrar OCH samma signaler för alla bortfallsnivåer
+  6. en batch går genom modell, loss och avkodning och ger ändliga tal (kräver torch)
 
-Steg 5 hoppas över om torch saknas, så sviten går att köra på en maskin utan GPU-stack.
+Steg 6 hoppas över om torch saknas, så sviten går att köra på en maskin utan GPU-stack.
 """
 import sys
 
@@ -23,7 +24,7 @@ from config import cfg
 from data import create_emitter_data
 from labels import roundtrip_ok, to_tokens
 from verify import verify_label
-from vocab import in_bin_of, in_cont_of
+from vocab import in_bin_of, in_cont_of, pri_of_bin
 
 FAIL = []
 
@@ -82,6 +83,69 @@ def test_labels(n=400):
 
 
 # ------------------------------------------------------------------ 3
+def _levels(*fracs):
+    """Nivåer på givna andelar av binrymden. Garanterat distinkta bins, oavsett config."""
+    return [pri_of_bin(int((cfg.n_bins - 1) * f)) for f in fracs]
+
+
+def test_canonical(n=300):
+    """
+    Rundturen i steg 1 kontrollerar bara att ETT facit överlever fram och tillbaka.
+    Den upptäcker inte att två likvärdiga beskrivningar av SAMMA emitter ger olika
+    tokensträngar -- och det är ett dyrare fel, för då ser modellen identiska
+    signaler med olika mål och lossen får ett golv som ingen träning tar bort.
+    """
+    print("\n3) kanonisering: en emitter, ett facit")
+    rng = np.random.default_rng(3)
+
+    a = to_tokens(_levels(0.2, 0.5), [4, 4], True, False)   # nollbrett RANGE
+    b = to_tokens(_levels(0.2, 0.5), [4], True, True)       # fast dwell
+    check("RANGE med min == max blir FIXED", a == b,
+          "" if a == b else f"\n        {' '.join(a)}\n        {' '.join(b)}")
+
+    a = to_tokens(_levels(0.2, 0.5), [7, 7, 7], True, True)
+    b = to_tokens(_levels(0.2, 0.5), [7], True, True)
+    check("upprepad längdcykel kollapsar till minsta period", a == b,
+          "" if a == b else f"\n        {' '.join(a)}\n        {' '.join(b)}")
+
+    # rotation: samma cykel, annan startfas -> samma facit
+    bad = None
+    for _ in range(n):
+        k = int(rng.integers(2, 6))
+        bins = sorted(rng.choice(np.arange(1, cfg.n_bins - 1), size=k, replace=False))
+        lv = [pri_of_bin(int(x)) for x in bins]
+        dw = [int(x) for x in rng.integers(1, 30, size=k)]
+        t0 = to_tokens(lv, dw, True, True)
+        r = int(rng.integers(1, k))
+        t1 = to_tokens(lv[r:] + lv[:r], dw[r:] + dw[:r], True, True)
+        if t0 != t1 and bad is None:
+            bad = (t0, t1)
+    check("rotation av cykeln ger samma facit", bad is None,
+          "" if bad is None else f"\n        {' '.join(bad[0])}\n        {' '.join(bad[1])}")
+
+    # INF betyder "lämnar aldrig nivån" och går inte att uttrycka som ett intervall.
+    # Ett RANGE med INF är självmotsägande och ska smälla, inte tyst tappa fältet.
+    try:
+        to_tokens(_levels(0.2, 0.5), [5, None], True, False)
+        raised = False
+    except AssertionError:
+        raised = True
+    check("RANGE med INF avvisas", raised)
+
+    # och att regeln faktiskt slår igenom på riktig data
+    data = gen(n)
+    both = sum(1 for _, l in data
+               if not l["length_fixed"]
+               and [x for x in l["lengths"] if x is not None]
+               and min(x for x in l["lengths"] if x is not None)
+               == max(x for x in l["lengths"] if x is not None))
+    kvar = sum(1 for _, l in data if "RANGE" in tok(l)
+               and tok(l)[tok(l).index("RANGE") + 1] == tok(l)[tok(l).index("RANGE") + 2])
+    check("inga nollbredda RANGE i facitet", kvar == 0,
+          f"{kvar}/{len(data)} kvar, {both} kandidater i generatorns utdata")
+
+
+# ------------------------------------------------------------------ 4
 def test_binning(n=200):
     """
     Två fällor: att vocab.py och data.py har glidit isär (de har varsin kopia av
@@ -89,7 +153,7 @@ def test_binning(n=200):
     kant-binen så att olika emittrar får identiska tokens.
     """
     from data import make_channels
-    print("\n3) binning")
+    print("\n4) binning")
 
     p = np.concatenate([np.geomspace(max(cfg.in_min, 1e-6), cfg.in_max * 0.999, 400),
                         [cfg.in_max, cfg.in_max * 2]])
@@ -111,9 +175,9 @@ def test_binning(n=200):
           f"input {w_in:.4f} µs, utdata {w_out:.4f} µs")
 
 
-# ------------------------------------------------------------------ 4
+# ------------------------------------------------------------------ 5
 def test_determinism():
-    print("\n4) reproducerbarhet över bortfallsnivåer")
+    print("\n5) reproducerbarhet över bortfallsnivåer")
     a = gen(6, 3, 0.00, seed=7)
     same_em = same_sig = True
     for p in (0.05, 0.20):
@@ -128,9 +192,9 @@ def test_determinism():
     check("samma underliggande signal oavsett drop_rate", same_sig)
 
 
-# ------------------------------------------------------------------ 5
+# ------------------------------------------------------------------ 6
 def test_model():
-    print("\n5) modell, loss och avkodning")
+    print("\n6) modell, loss och avkodning")
     try:
         import torch
     except ImportError:
@@ -191,6 +255,7 @@ if __name__ == "__main__":
           f"n_bins={cfg.n_bins}  in_bins={cfg.in_bins}")
     test_contract()
     test_labels()
+    test_canonical()
     test_binning()
     test_determinism()
     test_model()

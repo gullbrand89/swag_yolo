@@ -6,22 +6,25 @@ Snabb testsvit. Kör den innan varje längre träningskörning.
 Testerna är inte till för att bevisa att modellen fungerar utan för att fånga de
 fel som annars kostar en hel körning innan de märks:
 
+  0. generatorn håller kontraktet  -- oavsett vilken modul cfg.emitter pekar på
   1. facitet överlever rundturen to_tokens -> parse -> to_tokens
   2. facitet beskriver faktiskt sin egen signal (verify)
-  3. samma seed ger samma emittrar OCH samma signaler för alla bortfallsnivåer
-  4. belöningen rankar ett korrekt facit över ett stört
-  5. en batch går genom modell och loss och ger ett ändligt tal  (kräver torch)
+  3. en emitter har exakt ETT facit -- likvärdiga beskrivningar kanoniseras lika
+  4. binningen är konsekvent mellan vocab.py och data.py, och täcker datan
+  5. samma seed ger samma emittrar OCH samma signaler för alla bortfallsnivåer
+  6. en batch går genom modell, loss och avkodning och ger ändliga tal (kräver torch)
 
-Steg 5 hoppas över om torch saknas, så sviten går att köra på en maskin utan GPU-stack.
+Steg 6 hoppas över om torch saknas, så sviten går att köra på en maskin utan GPU-stack.
 """
 import sys
 
 import numpy as np
 
 from config import cfg
-from labels import parse, roundtrip_ok, to_tokens
-from reward import reward
+from data import create_emitter_data
+from labels import roundtrip_ok, to_tokens
 from verify import verify_label
+from vocab import in_bin_of, in_cont_of, pri_of_bin
 
 FAIL = []
 
@@ -36,14 +39,42 @@ def tok(lab):
     return to_tokens(lab["levels"], lab["lengths"], lab["order_fixed"], lab["length_fixed"])
 
 
+def gen(n_emitters, n_signals=1, p_drop=0.0, seed=0):
+    return create_emitter_data(n_emitters, n_signals, p_drop, cfg.noise_level,
+                               np.random.default_rng(seed))
+
+
+# ------------------------------------------------------------------ 0
+def test_contract(n_signals=3):
+    """
+    Kontraktet är hela poängen med cfg.emitter: byter du generator ska ingenting
+    annat behöva ändras. Ett kontrakt som bara står i en docstring är inget kontrakt.
+    """
+    print(f"\n0) generatorkontrakt ({cfg.emitter})")
+    d = gen(2, n_signals)
+    check("en post per emitter", len(d) == 2, f"{len(d)} poster")
+
+    seqs, lab = d[0]
+    check("en sekvens per signal", len(seqs) == n_signals,
+          f"{len(seqs)} sekvenser, väntade {n_signals}")
+
+    p = np.asarray(seqs[0], dtype=float)
+    check("varje sekvens är 1-D med pulser", p.ndim == 1 and p.size >= 16,
+          f"form {p.shape}")
+
+    saknas = [k for k in ("levels", "lengths", "order_fixed", "length_fixed")
+              if k not in lab]
+    check("etiketten har alla fält", not saknas,
+          f"saknar {saknas}" if saknas else f"{sorted(lab)}")
+
+
 # ------------------------------------------------------------------ 1-2
 def test_labels(n=400):
-    from data import create_emitter_data
-    print(f"\n1-2) facit ({cfg.emitter}, {n} emittrar x 2 signaler)")
-    data = create_emitter_data(n, 2, 0.0, cfg.noise_level, np.random.default_rng(0))
+    print(f"\n1-2) facit ({n} emittrar x 2 signaler)")
+    data = gen(n, 2)
 
-    bad_rt = sum(not roundtrip_ok(l["levels"], l["lengths"], l["order_fixed"], l["length_fixed"])
-                 for _, l in data)
+    bad_rt = sum(not roundtrip_ok(l["levels"], l["lengths"], l["order_fixed"],
+                                  l["length_fixed"]) for _, l in data)
     check("rundtur to_tokens -> parse -> to_tokens", bad_rt == 0, f"{bad_rt}/{n} fel")
 
     ok = sum(verify_label(s, l, verbose=False)["ok"] for seqs, l in data for s in seqs)
@@ -52,74 +83,131 @@ def test_labels(n=400):
 
 
 # ------------------------------------------------------------------ 3
+def _levels(*fracs):
+    """Nivåer på givna andelar av binrymden. Garanterat distinkta bins, oavsett config."""
+    return [pri_of_bin(int((cfg.n_bins - 1) * f)) for f in fracs]
+
+
+def test_canonical(n=300):
+    """
+    Rundturen i steg 1 kontrollerar bara att ETT facit överlever fram och tillbaka.
+    Den upptäcker inte att två likvärdiga beskrivningar av SAMMA emitter ger olika
+    tokensträngar -- och det är ett dyrare fel, för då ser modellen identiska
+    signaler med olika mål och lossen får ett golv som ingen träning tar bort.
+    """
+    print("\n3) kanonisering: en emitter, ett facit")
+    rng = np.random.default_rng(3)
+
+    a = to_tokens(_levels(0.2, 0.5), [4, 4], True, False)   # nollbrett RANGE
+    b = to_tokens(_levels(0.2, 0.5), [4], True, True)       # fast dwell
+    check("RANGE med min == max blir FIXED", a == b,
+          "" if a == b else f"\n        {' '.join(a)}\n        {' '.join(b)}")
+
+    a = to_tokens(_levels(0.2, 0.5), [7, 7, 7], True, True)
+    b = to_tokens(_levels(0.2, 0.5), [7], True, True)
+    check("upprepad längdcykel kollapsar till minsta period", a == b,
+          "" if a == b else f"\n        {' '.join(a)}\n        {' '.join(b)}")
+
+    # rotation: samma cykel, annan startfas -> samma facit
+    bad = None
+    for _ in range(n):
+        k = int(rng.integers(2, 6))
+        bins = sorted(rng.choice(np.arange(1, cfg.n_bins - 1), size=k, replace=False))
+        lv = [pri_of_bin(int(x)) for x in bins]
+        dw = [int(x) for x in rng.integers(1, 30, size=k)]
+        t0 = to_tokens(lv, dw, True, True)
+        r = int(rng.integers(1, k))
+        t1 = to_tokens(lv[r:] + lv[:r], dw[r:] + dw[:r], True, True)
+        if t0 != t1 and bad is None:
+            bad = (t0, t1)
+    check("rotation av cykeln ger samma facit", bad is None,
+          "" if bad is None else f"\n        {' '.join(bad[0])}\n        {' '.join(bad[1])}")
+
+    # INF betyder "lämnar aldrig nivån" och går inte att uttrycka som ett intervall.
+    # Ett RANGE med INF är självmotsägande och ska smälla, inte tyst tappa fältet.
+    try:
+        to_tokens(_levels(0.2, 0.5), [5, None], True, False)
+        raised = False
+    except AssertionError:
+        raised = True
+    check("RANGE med INF avvisas", raised)
+
+    # och att regeln faktiskt slår igenom på riktig data
+    data = gen(n)
+    both = sum(1 for _, l in data
+               if not l["length_fixed"]
+               and [x for x in l["lengths"] if x is not None]
+               and min(x for x in l["lengths"] if x is not None)
+               == max(x for x in l["lengths"] if x is not None))
+    kvar = sum(1 for _, l in data if "RANGE" in tok(l)
+               and tok(l)[tok(l).index("RANGE") + 1] == tok(l)[tok(l).index("RANGE") + 2])
+    check("inga nollbredda RANGE i facitet", kvar == 0,
+          f"{kvar}/{len(data)} kvar, {both} kandidater i generatorns utdata")
+
+
+# ------------------------------------------------------------------ 4
+def test_binning(n=200):
+    """
+    Två fällor: att vocab.py och data.py har glidit isär (de har varsin kopia av
+    inputbinningen), och att nivåer utanför pri_min/pri_max klipps tyst in i
+    kant-binen så att olika emittrar får identiska tokens.
+    """
+    from data import make_channels
+    print("\n4) binning")
+
+    p = np.concatenate([np.geomspace(max(cfg.in_min, 1e-6), cfg.in_max * 0.999, 400),
+                        [cfg.in_max, cfg.in_max * 2]])
+    ch = make_channels(p)
+    check("vocab.py och data.py binnar lika",
+          bool((ch["bins"] == [in_bin_of(x) for x in p]).all()))
+    check("vocab.py och data.py ger samma cont",
+          bool(np.allclose(ch["cont"], [in_cont_of(x) for x in p], atol=1e-6)))
+
+    lv = np.concatenate([np.unique(np.asarray(l["levels"], dtype=float).ravel())
+                         for _, l in gen(n)])
+    out = ((lv < cfg.pri_min) | (lv > cfg.pri_max)).mean()
+    check("alla nivåer ryms i pri_min..pri_max", out == 0,
+          f"{out:.2%} klipps, spann {lv.min():.3f}–{lv.max():.3f} µs")
+
+    w_out = (cfg.pri_max - cfg.pri_min) / (cfg.n_bins - 1)
+    w_in = (cfg.in_max - cfg.in_min) / (cfg.in_bins - 2)
+    check("inputen är minst lika fin som utdatan", w_in <= w_out * 1.01,
+          f"input {w_in:.4f} µs, utdata {w_out:.4f} µs")
+
+
+# ------------------------------------------------------------------ 5
 def test_determinism():
-    from data import create_emitter_data
-    print("\n3) reproducerbarhet över bortfallsnivåer")
-    a = create_emitter_data(6, 3, 0.00, None, np.random.default_rng(7))
+    print("\n5) reproducerbarhet över bortfallsnivåer")
+    a = gen(6, 3, 0.00, seed=7)
     same_em = same_sig = True
     for p in (0.05, 0.20):
-        b = create_emitter_data(6, 3, p, None, np.random.default_rng(7))
+        b = gen(6, 3, p, seed=7)
         for (sa, la), (sb, lb) in zip(a, b):
-            same_em &= bool(np.allclose(la["levels"], lb["levels"]))
+            same_em &= bool(np.allclose(np.ravel(la["levels"]), np.ravel(lb["levels"])))
             for x, y in zip(sa, sb):
-                # bortfall tar bort pulser; TOA:erna som blir kvar måste vara en
-                # delmängd av den rena signalens
+                # bortfall tar bort pulser; de som blir kvar måste vara en delmängd
                 ta, tb = np.round(np.cumsum(x), 6), np.round(np.cumsum(y), 6)
                 same_sig &= bool(np.isin(tb[:-1], ta).all())
     check("samma emittrar oavsett drop_rate", same_em)
     check("samma underliggande signal oavsett drop_rate", same_sig)
 
 
-# ------------------------------------------------------------------ 4
-def test_reward(n=200):
-    from data import create_emitter_data
-    from vocab import bin_of, pri_of_bin
-    print("\n4) belöningen rankar rätt")
-    rng = np.random.default_rng(0)
-
-    for p in (0.0, 0.10, 0.20):
-        data = create_emitter_data(n, 1, p, None, np.random.default_rng(0))
-        true_r, win, tot = [], 0, 0
-        for seqs, lab in data:
-            t = tok(lab); s = seqs[0]
-            r0 = reward(t, s)
-            true_r.append(r0)
-            d = parse(t)
-            lv = list(d["order"] if d["order_fixed"] else d["levels"])
-            i = int(rng.integers(len(lv)))
-            lv[i] = pri_of_bin(min(cfg.n_bins - 1, bin_of(lv[i]) + 5))     # nivå 5 bins fel
-            try:
-                pt = to_tokens(lv, d["lengths"], d["order_fixed"], d["length_fixed"])
-            except Exception:
-                continue
-            if pt == t:
-                continue
-            tot += 1
-            win += r0 > reward(pt, s)
-        mean = float(np.mean(true_r))
-        floor = 0.99 if p == 0 else 0.70
-        check(f"sant facit får hög belöning (drop {p:.2f})", mean >= floor, f"medel {mean:.3f}")
-        check(f"sant facit slår stört facit (drop {p:.2f})", win / max(1, tot) >= 0.95,
-              f"{win}/{tot} = {win/max(1,tot):.1%}")
-
-
-# ------------------------------------------------------------------ 5
+# ------------------------------------------------------------------ 6
 def test_model():
-    print("\n5) modell, loss och sampling")
+    print("\n6) modell, loss och avkodning")
     try:
         import torch
     except ImportError:
         print("  --   torch saknas, hoppar över")
         return
 
-    from data import StreamDataset, collate_rl
-    from grpo import completion_mask
+    from data import StreamDataset, collate
     from loss import loss_by_field, loss_fn
     from model import build_model
-    from vocab import EOS
+    from vocab import EOS, PAD, ids_to_tokens
 
     ds = StreamDataset(4, 0)
-    src, tgt_in, tgt_out, pris = collate_rl([ds[i] for i in range(2)])
+    src, tgt_in, tgt_out = collate([ds[i] for i in range(2)])
     model = build_model()
 
     logits = model(src, tgt_in)
@@ -128,42 +216,48 @@ def test_model():
 
     l = loss_fn(logits, tgt_out)
     check("loss är ändlig", bool(torch.isfinite(l)), f"{l.item():.4f}")
-    ln, lo, lg = loss_by_field(logits, tgt_out)
-    check("fältvis loss är ändlig", all(np.isfinite([ln, lo, lg])),
-          f"num {ln:.3f} order {lo:.3f} grammar {lg:.3f}")
+    f = loss_by_field(logits, tgt_out)
+    fields = f if isinstance(f, dict) else dict(zip(("num", "order", "grammar"), f))
+    check("fältvis loss är ändlig", all(np.isfinite(list(fields.values()))),
+          "  ".join(f"{k} {v:.3f}" for k, v in fields.items()))
+
+    # vid slumpvikter ska lossen ligga nära ln(V) -- ligger den långt ifrån är
+    # något fel på maskning eller målfördelning
+    import math
+    check("loss nära slumpnivån ln(V) vid init",
+          abs(l.item() - math.log(logits.size(-1))) < 1.5,
+          f"{l.item():.3f} mot ln({logits.size(-1)}) = {math.log(logits.size(-1)):.3f}")
 
     l.backward()
     g = sum(float(p.grad.abs().sum()) for p in model.parameters() if p.grad is not None)
     check("gradienten når vikterna", g > 0)
 
     model.eval()
-    G = 3
-    seq = model.generate(src, n=G, greedy=False, temperature=1.0, max_new=24)
-    check("generate ger G sampel per exempel", seq.size(0) == tgt_out.size(0) * G,
+    seq = model.greedy(src, max_new=32)
+    check("greedy ger en rad per exempel", seq.size(0) == tgt_out.size(0),
           f"{seq.size(0)} rader")
-    cm = completion_mask(seq)
-    after_eos_ok = True
-    for row in range(seq.size(0)):
-        t = seq[row, 1:]
-        e = (t == EOS).nonzero()
-        if e.numel():
-            after_eos_ok &= not bool(cm[row, e[0, 0] + 1:].any())
-    check("completion_mask stänger av allt efter EOS", after_eos_ok)
-    check("belöningen tar modellens utdata utan att krascha",
-          all(np.isfinite(reward(_ids(seq[i]), pris[i // G])) for i in range(seq.size(0))))
+    check("greedy börjar med BOS och innehåller inga PAD före EOS",
+          all(_well_formed(seq[i], EOS, PAD) for i in range(seq.size(0))))
+    check("utdatan går att läsa som tokens",
+          all(isinstance(ids_to_tokens(seq[i].cpu()), list) for i in range(seq.size(0))))
 
 
-def _ids(row):
-    from vocab import ids_to_tokens
-    return ids_to_tokens(row.cpu())
+def _well_formed(row, EOS, PAD):
+    t = row[1:]
+    e = (t == EOS).nonzero()
+    cut = int(e[0, 0]) if e.numel() else t.numel()
+    return not bool((t[:cut] == PAD).any())
 
 
 # ------------------------------------------------------------------
 if __name__ == "__main__":
-    print(f"config: emitter={cfg.emitter}  model={cfg.model}  n_bins={cfg.n_bins}")
+    print(f"config: emitter={cfg.emitter}  model={cfg.model}  "
+          f"n_bins={cfg.n_bins}  in_bins={cfg.in_bins}")
+    test_contract()
     test_labels()
+    test_canonical()
+    test_binning()
     test_determinism()
-    test_reward()
     test_model()
     print("\n" + ("ALLT GRÖNT" if not FAIL else f"{len(FAIL)} FEL: " + ", ".join(FAIL)))
     sys.exit(1 if FAIL else 0)

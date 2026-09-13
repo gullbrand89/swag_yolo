@@ -51,14 +51,25 @@ def main():
     torch.backends.cudnn.allow_tf32 = True
     dev = "cuda" if torch.cuda.is_available() else "cpu"
 
+    t0 = time.time()
+    print(f"genererar {a.emitters} + {a.emitters // 2} emittrar "
+          f"({cfg.samples_per_emitter} signaler styck)...", flush=True)
     tr = make_pairs(np.random.default_rng(11), a.emitters, a.p_drop)
+    print(f"  träning klar: {len(tr)} sekvenser, {time.time() - t0:.0f}s", flush=True)
     ev = make_pairs(np.random.default_rng(12), a.emitters // 2, a.p_drop)
-    print(f"fast data: {len(tr)} träningssekvenser, {len(ev)} evalsekvenser, "
-          f"p_drop {a.p_drop}, {dev}")
+    print(f"  eval klar:    {len(ev)} sekvenser, {time.time() - t0:.0f}s", flush=True)
+    print(f"fast data, p_drop {a.p_drop}, {dev}", flush=True)
 
-    tl = DataLoader(tr, batch_size=a.batch, shuffle=True, collate_fn=collate,
-                    drop_last=True)
-    el = DataLoader(ev, batch_size=a.batch, shuffle=False, collate_fn=collate)
+    # batchen får aldrig vara större än datamängden, och drop_last=True på en för
+    # liten mängd ger en TOM loader -- då snurrar while-loopen nedan för evigt utan
+    # att ta ett enda steg.
+    assert tr and ev, "tom datamängd -- höj --emitters"
+    bs = max(1, min(a.batch, len(tr)))
+    tl = DataLoader(tr, batch_size=bs, shuffle=True, collate_fn=collate,
+                    drop_last=False)
+    el = DataLoader(ev, batch_size=bs, shuffle=False, collate_fn=collate)
+    print(f"batch {bs}, {len(tl)} batchar per epok "
+          f"({cfg.samples_per_emitter} signaler per emitter)", flush=True)
 
     model = build_model().to(dev)
     opt = torch.optim.AdamW(model.parameters(), lr=a.lr,
@@ -83,7 +94,7 @@ def main():
         return tot / max(1, n)
 
     print(f"\n{'steg':>6}{'train':>9}{'num':>9}{'order':>9}{'grammar':>9}"
-          f"{'eval':>9}{'lr':>10}{'s':>6}")
+          f"{'eval':>9}{'lr':>10}{'s':>6}", flush=True)
     step, t0 = 0, time.time()
     model.train()
     while step < a.steps:
@@ -97,7 +108,7 @@ def main():
             nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step(); sched.step(); step += 1
 
-            if step % 100 == 0 or step >= a.steps:
+            if step in (1, 10, 50) or step % 100 == 0 or step >= a.steps:
                 f = loss_by_field(logits, to)
                 f = f if isinstance(f, dict) else dict(
                     zip(("num", "order", "grammar"), f))
@@ -105,7 +116,7 @@ def main():
                 print(f"{step:>6}{float(loss):>9.4f}"
                       + "".join(f"{v:>9.4f}" for v in f.values())
                       + f"{e:>9.4f}{sched.get_last_lr()[0]:>10.2e}"
-                      + f"{time.time() - t0:>6.0f}")
+                      + f"{time.time() - t0:>6.0f}", flush=True)
             if step >= a.steps:
                 break
 

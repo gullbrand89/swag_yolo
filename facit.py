@@ -13,10 +13,15 @@ Vad ett facit är
 ----------------
 En bibliotekspost som beskriver emittern, inte observationen:
 
-    LEVELS N3  L0 N102  L1 N255  L2 N408      vilka PRI-nivåer den använder
+    LEVELS  L0 B102  L1 B255  L2 B408         vilka PRI-nivåer den använder
     ORDER FIXED L0 L1 L2                      i vilken ordning den besöker dem
-    DWELL FIXED N10 N5                        hur många pulser den stannar
+    DWELL FIXED D10 D5                        hur många pulser den stannar
     END
+
+B-token är nivåer (bins i emitterrymden), D-token är dwelltider (antal pulser).
+Skilda rymder: en bin är en mätning med ändlig noggrannhet, en dwelltid ett exakt
+antal, och de tål inte samma utjämning. Nivåblocket har inget antalstoken --
+antalet går att läsa av genom att räkna par tills ORDER dyker upp.
 
 Ordnings- och längdcyklerna är separata block med oberoende perioder: en emitter
 kan ha tre nivåer men bara två skilda dwelltider.
@@ -216,14 +221,14 @@ def till_tokens(levels, lengths, order_fixed, length_fixed):
 
     # ---- nivådefinitionerna
     #
-    # N<antal> är REDUNDANT: nivånamn och ORDER är disjunkta tokenklasser, så en
-    # parser kan läsa par tills ORDER dyker upp. Den ligger kvar här bara för att
-    # matcha nuvarande labels.py. Tas den bort försvinner den här raden, och
-    # parsern nedan byter den räknande loopen mot en while-loop.
-    tokens = ["LEVELS", f"N{len(unika)}"]
+    # Inget antalstoken: nivånamn och ORDER är disjunkta tokenklasser, så parsern
+    # läser par tills ORDER dyker upp. Ett explicit antal var dessutom det fält
+    # modellen var sämst på, och ett fel i det gjorde hela posten otolkbar vid
+    # avkodning även när varenda nivå var rätt.
+    tokens = ["LEVELS"]
     for b in unika:
         tokens.append(namn[b])
-        tokens.append(f"N{b}")
+        tokens.append(f"B{b}")
 
     sekvens_min = steg4_minsta_period(sekvens)
     if cfg.compress_lengths:
@@ -261,7 +266,7 @@ def till_tokens(levels, lengths, order_fixed, length_fixed):
         tokens.append("DWELL")
         tokens.append("FIXED")
         for n in langder_ut:
-            tokens.append("INF" if n is None else f"N{int(n)}")
+            tokens.append("INF" if n is None else f"D{int(n)}")
     else:
         if len(lengths) == 0:
             raise AssertionError("DWELL RANGE utan längder")
@@ -270,8 +275,8 @@ def till_tokens(levels, lengths, order_fixed, length_fixed):
                 raise AssertionError(f"DWELL RANGE kan inte innehålla INF: {lengths}")
         tokens.append("DWELL")
         tokens.append("RANGE")
-        tokens.append(f"N{min(lengths)}")
-        tokens.append(f"N{max(lengths)}")
+        tokens.append(f"D{min(lengths)}")
+        tokens.append(f"D{max(lengths)}")
 
     tokens.append("END")
     return tokens
@@ -287,25 +292,31 @@ def fran_tokens(tokens):
     def ar_niva(t):
         return t.startswith("L") and t[1:].isdigit()
 
-    def tal(t):
-        if not (t.startswith("N") and t[1:].isdigit()):
-            raise ValueError(f"väntade tal, fick {t}")
+    def bin_tal(t):
+        if not (t.startswith("B") and t[1:].isdigit()):
+            raise ValueError(f"väntade nivåbin, fick {t}")
+        return int(t[1:])
+
+    def dur_tal(t):
+        if not (t.startswith("D") and t[1:].isdigit()):
+            raise ValueError(f"väntade dwelltid, fick {t}")
         return int(t[1:])
 
     if tokens[i] != "LEVELS":
         raise ValueError("saknar LEVELS")
     i += 1
 
-    antal = tal(tokens[i]); i += 1          # tas bort när antalstoken försvinner
+    # Inget antal att läsa: par tills ORDER. Avgränsningen är entydig eftersom
+    # nivånamn (L...) och ORDER inte kan förväxlas.
     namn_till_pri = {}
-    for _ in range(antal):
+    while ar_niva(tokens[i]):
         namn = tokens[i]; i += 1
-        if not ar_niva(namn):
-            raise ValueError(f"väntade nivånamn, fick {namn}")
-        namn_till_pri[namn] = pri_av_bin(tal(tokens[i])); i += 1
+        namn_till_pri[namn] = pri_av_bin(bin_tal(tokens[i])); i += 1
+    if not namn_till_pri:
+        raise ValueError("tom nivådefinition")
 
     if tokens[i] != "ORDER":
-        raise ValueError("saknar ORDER")
+        raise ValueError(f"väntade ORDER, fick {tokens[i]}")
     i += 1
 
     ordning = []
@@ -323,7 +334,7 @@ def fran_tokens(tokens):
 
     langder = []
     while tokens[i] != "END":
-        langder.append(None if tokens[i] == "INF" else tal(tokens[i]))
+        langder.append(None if tokens[i] == "INF" else dur_tal(tokens[i]))
         i += 1
 
     return dict(levels=sorted(namn_till_pri.values()), order=ordning,

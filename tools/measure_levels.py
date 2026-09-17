@@ -22,15 +22,15 @@ Svarar på tre frågor:
 Du behöver inte veta hur generatorn fungerar -- bara vad den producerar.
 """
 import argparse
-import importlib
 import math
 
 import numpy as np
 
-from config import cfg
+from transformer_post_generator import emitter_module
+from transformer_post_generator.config import cfg
 
 # Samma modul som data.py använder, men utan att dra in torch för en numpy-analys.
-create_emitter_data = importlib.import_module(cfg.emitter).create_emitter_data
+create_emitter_data = emitter_module().create_emitter_data
 
 
 def separations(level_sets):
@@ -109,7 +109,7 @@ def report(level_sets, coverage=0.99, margin=2.0, cfg_range=None,
     print(f"  pri_min: float = {lo * 0.98:.4g}")
     print(f"  pri_max: float = {hi * 1.02:.4g}")
     print(f"  n_bins:  int   = {n}")
-    print(f"  max_int: int   = {n - 1}        # höj om någon dwell-längd är större")
+    print(f"  max_dur: int   = {n - 1}        # höj om någon dwell-längd är större")
     if best == "logaritmisk" and n_log < n_lin:
         print(f"\n  Avstånden är relativa, inte absoluta -- byt bin_of/pri_of_bin i")
         print(f"  vocab.py till logaritmisk binning. Är kvoten nära 1 spelar det")
@@ -263,7 +263,7 @@ def main():
 
     if args.variants:
         try:
-            from all_emitters import GEN, VARIANTS
+            from transformer_post_generator.all_emitters import GEN, VARIANTS
         except ImportError:
             print("\n(--variants kräver all_emitters)")
             return

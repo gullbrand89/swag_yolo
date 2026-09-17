@@ -3,14 +3,32 @@ Två varianter med samma gränssnitt:
     model(src, tgt_in) -> logits
     model.greedy(src)  -> token-ids
 src är dicten från collate (bins, cont, toa, rl, flag, mask).
+
+Ändringar mot föregående version, båda i encoderns attention:
+
+  * QK-normalisering. Ingenting begränsade tidigare q·k, så attention-logitarna
+    kunde växa med qkv-vikternas norm. Softmaxen blir då successivt spetsigare tills
+    varje position i praktiken attenderar på en enda nyckel, gradienten genom
+    attention kollapsar och modellen tappar uttrycksförmåga -- för ALLA uppgifter
+    samtidigt, även de redan lösta. Encodern kör över 1024 positioner, vilket är den
+    regim där det inträffar. Styrs av cfg.qk_norm (default True) så att den går att
+    ablera.
+
+  * RoPE i fp32. apply_rope multiplicerade cos/sin med q och k, som under autocast är
+    bfloat16 -- åtta mantissabitar, alltså ungefär tre decimalers precision på
+    rotationen. Rotationen görs nu i fp32 och castas tillbaka.
+
+Decodern använder nn.TransformerDecoderLayer och har ingen QK-normalisering. Den kör
+över ~40 token i stället för 1024 och är därför betydligt mindre utsatt; vill man ha
+det även där måste lagret skrivas för hand. Detsamma gäller IndexModel.
 """
 import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from config import cfg
-from vocab import VOCAB, PAD, BOS, EOS
+from .config import cfg
+from .vocab import VOCAB, PAD, BOS, EOS
 
 
 # ---------------- gemensamt
@@ -145,22 +163,43 @@ class HybridRoPE(nn.Module):
         self.register_buffer("ft", base ** (-torch.arange(n_time) / max(n_time, 1)))
         self.register_buffer("fi", base ** (-torch.arange(n_idx) / max(n_idx, 1)))
     def forward(self, toa, idx):
-        ang = torch.cat([toa[..., None] * self.ft, idx[..., None] * self.fi], -1)
+        # fp32 hela vägen: vinklarna når flera tusen radianer för långa sekvenser och
+        # tål inte bfloat16:s åtta mantissabitar.
+        ang = torch.cat([toa.float()[..., None] * self.ft.float(),
+                         idx.float()[..., None] * self.fi.float()], -1)
         return ang.cos()[:, None], ang.sin()[:, None]
 
 def apply_rope(x, cos, sin):
+    """Rotationen görs i fp32 och castas tillbaka till x:s dtype.
+
+    Under autocast är x bfloat16, och utan den här konverteringen castas cos/sin ner
+    dit -- ungefär tre decimalers precision på en rotation som ska vara exakt."""
     d = x.size(-1) // 2
-    x1, x2 = x[..., :d], x[..., d:]
-    return torch.cat([x1 * cos - x2 * sin, x1 * sin + x2 * cos], -1)
+    x1, x2 = x[..., :d].float(), x[..., d:].float()
+    cos, sin = cos.float(), sin.float()
+    out = torch.cat([x1 * cos - x2 * sin, x1 * sin + x2 * cos], -1)
+    return out.to(x.dtype)
 
 class RoPEAttention(nn.Module):
     def __init__(self, d, nhead, dropout):
         super().__init__()
         self.h, self.dh = nhead, d // nhead
         self.qkv = nn.Linear(d, 3 * d); self.proj = nn.Linear(d, d); self.drop = dropout
+        # QK-norm håller attention-logitarna i schack. Utan den växer q·k med
+        # qkv-vikternas norm, softmaxen kollapsar mot one-hot och gradienten genom
+        # attention dör -- långsamt, och utan att bry sig om learning rate.
+        self.qk_norm = getattr(cfg, "qk_norm", True)
+        if self.qk_norm:
+            self.qn = nn.LayerNorm(self.dh)
+            self.kn = nn.LayerNorm(self.dh)
     def forward(self, x, cos, sin, mask):
         B, T, _ = x.shape
         q, k, v = self.qkv(x).view(B, T, 3, self.h, self.dh).permute(2, 0, 3, 1, 4)
+        if self.qk_norm:
+            # före rotationen: RoPE är ortogonal och bevarar normen, så ordningen
+            # spelar roll bara för att LayerNorm annars skulle blanda ihop de
+            # roterade komponenterna
+            q, k = self.qn(q), self.kn(k)
         q, k = apply_rope(q, cos, sin), apply_rope(k, cos, sin)
         am = (~mask)[:, None, None, :] if mask is not None else None
         o = F.scaled_dot_product_attention(q, k, v, attn_mask=am,

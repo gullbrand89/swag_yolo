@@ -14,16 +14,16 @@ För varje avvikelse visas:
 import sys
 import numpy as np
 
-from config import cfg
-from vocab import bin_of, pri_of_bin
-from labels import to_tokens, parse
-from verify import (verify_label, _as_label, _quantize, _visits,
+from transformer_post_generator.config import cfg
+from transformer_post_generator.vocab import bin_of, pri_of_bin
+from transformer_post_generator.labels import to_tokens, parse
+from transformer_post_generator.verify import (verify_label, _as_label, _quantize, _visits,
                     _min_period, _best_rotation, _print_report)
 
-from data import create_emitter_data          # följer cfg.emitter
+from transformer_post_generator.data import create_emitter_data          # följer cfg.emitter
 
 try:
-    from all_emitters import VARIANTS            # bara all_emitters har varianter
+    from transformer_post_generator.all_emitters import VARIANTS            # bara all_emitters har varianter
 except ImportError:
     VARIANTS = None
 

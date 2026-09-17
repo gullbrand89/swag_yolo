@@ -17,12 +17,12 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
-from config import cfg
-from data import StreamDataset, collate, create_emitter_data, make_eval_sets
-from labels import roundtrip_ok
-from loss import loss_by_field, loss_fn
-from model import build_model
-from runlog import RunLog, evaluate
+from .config import cfg
+from .data import StreamDataset, collate, create_emitter_data, make_eval_sets
+from .labels import roundtrip_ok
+from .loss import loss_by_field, loss_fn
+from .model import build_model
+from .runlog import RunLog, evaluate
 
 
 def sanity_checks(n=500):
@@ -75,17 +75,24 @@ def main():
         logits = model(src, tgt_in)
         loss = loss_fn(logits, tgt_out)
         opt.zero_grad(set_to_none=True); loss.backward()
-        nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        gn = nn.utils.clip_grad_norm_(
+            model.parameters(), cfg.clip if cfg.clip > 0 else float("inf"))
         opt.step(); sched.step(); step += 1
 
         # loss_by_field bygger en till tät (B, T, V)-tensor. Den är bara till för
         # loggen, så den körs inte varje steg.
         if step % cfg.log_every == 0 or step >= args.steps:
             ln, lo, lg = loss_by_field(logits, tgt_out)
+            # grad_norm är normen FÖRE klippning. Ligger medianen långt över cfg.clip
+            # är klippningen aktiv varje steg och sätter stegstorleken i stället för lr.
+            with torch.no_grad():
+                wn = sum(float(p.norm()) ** 2 for p in model.parameters()) ** 0.5
             run.log(step=step, loss=loss.item(), loss_num=ln, loss_order=lo,
-                    loss_grammar=lg, lr=sched.get_last_lr()[0])
+                    loss_grammar=lg, grad_norm=float(gn),
+                    logit_max=float(logits.detach().abs().max()), weight_norm=wn,
+                    lr=sched.get_last_lr()[0])
             print(f"step {step:6d}  loss {loss.item():.4f}  num {ln:.4f}  order {lo:.4f}  "
-                  f"grammar {lg:.4f}  {time.time()-t0:.0f}s")
+                  f"grammar {lg:.4f}  |g| {float(gn):.2f}  {time.time()-t0:.0f}s")
 
         if step % cfg.eval_every == 0 or step >= args.steps:
             run.log_eval(step, evaluate(model, eval_sets, device, collate, run))

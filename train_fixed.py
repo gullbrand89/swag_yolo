@@ -31,10 +31,10 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
-from config import cfg
-from data import collate, make_pairs
-from loss import loss_by_field, loss_fn
-from model import build_model
+from transformer_post_generator.config import cfg
+from transformer_post_generator.data import collate, make_pairs
+from transformer_post_generator.loss import loss_by_field, loss_fn
+from transformer_post_generator.model import build_model
 
 
 def main():

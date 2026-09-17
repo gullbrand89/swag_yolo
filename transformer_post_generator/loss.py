@@ -1,28 +1,47 @@
-"""Cross-entropy med ordinal smoothing på N-tokens och fältviktning."""
-import math
+"""Cross-entropy med ordinal smoothing på numeriska token och fältviktning."""
 import torch
 import torch.nn.functional as F
-from config import cfg
-from vocab import VOCAB, TOK2ID, PAD, IS_NUM, NUM_START, NUM, LEVEL_NAMES
+
+from .config import cfg
+from .vocab import (IS_NUM, LEVEL_NAMES, PAD, RANGE_HI, RANGE_LO, SIGMA, TOK2ID,
+                   VOCAB)
 
 _ORDER, _DWELL, _END = TOK2ID["ORDER"], TOK2ID["DWELL"], TOK2ID["END"]
 _TYPE = torch.tensor([TOK2ID["FIXED"], TOK2ID["RANDOM"], TOK2ID["RANGE"]])
 _LVL0, _LVL1 = TOK2ID[LEVEL_NAMES[0]], TOK2ID[LEVEL_NAMES[-1]]
 
 
-def ordinal_targets(tgt, sigma=1.0):
-    B, T = tgt.shape; V = len(VOCAB); w = cfg.smooth_width
-    soft = torch.zeros(B, T, V, device=tgt.device)
+def ordinal_targets(tgt):
+    """
+    Mjukt mål för numeriska token: en diskretiserad gaussian över grannvärden.
+
+    Bredden tas per token ur vocab.SIGMA, så att nivåbins och dwelltider kan ha olika
+    utjämning. Utsmetningen klamras till den egna rymden via RANGE_LO/RANGE_HI --
+    massa som läckte över till den andra rymden vore inte "nästan rätt" utan fel
+    sorts svar.
+
+    Golvet för korsentropin är målfördelningens entropi, ungefär ln(sigma) + 1.42 för
+    sigma >= 1. Sigma = 0 ger ett rent one-hot-mål och golvet noll.
+    """
+    B, T = tgt.shape
+    V = len(VOCAB)
+    w = cfg.smooth_width
+    dev = tgt.device
+
+    soft = torch.zeros(B, T, V, device=dev)
     soft.scatter_(2, tgt[..., None], 1.0)
-    isnum = IS_NUM.to(tgt.device)[tgt] & (tgt != PAD)
+
+    isnum = IS_NUM.to(dev)[tgt] & (tgt != PAD)
     if w > 0 and isnum.any():
         idx = tgt[isnum]
-        rows = torch.zeros(idx.numel(), V, device=tgt.device)
-        ar = torch.arange(idx.numel(), device=tgt.device)
+        lo, hi = RANGE_LO.to(dev)[idx], RANGE_HI.to(dev)[idx]
+        sig = SIGMA.to(dev)[idx].clamp(min=1e-6)
+        rows = torch.zeros(idx.numel(), V, device=dev)
+        ar = torch.arange(idx.numel(), device=dev)
         for off in range(-w, w + 1):
             j = idx + off
-            ok = (j >= NUM_START) & (j < NUM_START + len(NUM))
-            rows[ar[ok], j[ok]] += math.exp(-0.5 * (off / sigma) ** 2)
+            ok = (j >= lo) & (j <= hi)
+            rows[ar[ok], j[ok]] += torch.exp(-0.5 * (off / sig[ok]) ** 2)
         soft[isnum] = rows / rows.sum(-1, keepdim=True)
     return soft
 
@@ -38,7 +57,7 @@ def loss_fn(logits, tgt_out):
 def field_masks(tgt):
     """
     Delar upp facit-positionerna i tre fält:
-      num     : N-tokens (nivåbins, längder, antal)
+      num     : B- och D-token (nivåbins och dwelltider)
       order   : nivånamn inne i ORDER-blocket + FIXED/RANDOM-valen  (innehåll)
       grammar : allt annat (LEVELS, ORDER, DWELL, END, INF, nivånamn i definitionerna)
     """
@@ -66,3 +85,17 @@ def loss_by_field(logits, tgt_out):
     for m in field_masks(tgt_out):
         out.append(((per_tok * m).sum() / m.sum().clamp(min=1)).item())
     return tuple(out)
+
+
+@torch.no_grad()
+def num_acc(logits, tgt_out, tol=0):
+    """Andel numeriska token där argmax ligger inom `tol` steg från facit, inom
+    samma tokenrymd. Det måttet -- inte lossen -- är framstegssignalen: med ett
+    utjämnat mål straffas en modell som blir mer bestämd än målfördelningen även
+    när argmax är helt rätt."""
+    isnum, _, _ = field_masks(tgt_out)
+    pred = logits.argmax(-1)
+    dev = tgt_out.device
+    same = (RANGE_LO.to(dev)[pred] == RANGE_LO.to(dev)[tgt_out]) & IS_NUM.to(dev)[pred]
+    ok = isnum & same & ((pred - tgt_out).abs() <= tol)
+    return (ok.sum() / isnum.sum().clamp(min=1)).item()

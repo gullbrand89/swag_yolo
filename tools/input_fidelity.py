@@ -12,13 +12,13 @@ inputens upplösning och inte dess räckvidd.
 Den avgörande raden är "nivåer som krockar i input-bin". Är den inte 0 är det där felet
 sitter.
 """
-import importlib
 
 import numpy as np
 
-from config import cfg
-from data import make_channels
-from vocab import bin_of, in_bin_of
+from transformer_post_generator import emitter_module
+from transformer_post_generator.config import cfg
+from transformer_post_generator.data import make_channels
+from transformer_post_generator.vocab import bin_of, in_bin_of
 
 N_EMITTERS = 200
 
@@ -35,11 +35,12 @@ def main():
     print(f"  facit  : pri_min {cfg.pri_min}  pri_max {cfg.pri_max}  n_bins {cfg.n_bins}"
           f"   -> {(cfg.pri_max - cfg.pri_min) / (cfg.n_bins - 1):.4f} µs/bin (linjär)")
     print(f"  input  : in_min  {cfg.in_min}  in_max  {cfg.in_max}  in_bins {cfg.in_bins}"
-          f"   (logaritmisk)")
+          f"   -> {(cfg.in_max - cfg.in_min) / (cfg.in_bins - 2):.4f} µs/bin "
+          f"(linjär, sista bin = overflow)")
     print(f"  toa_scale {cfg.toa_scale}   run_tol_bins {cfg.run_tol_bins}")
     print()
 
-    gen = importlib.import_module(cfg.emitter)
+    gen = emitter_module()
     data = gen.create_emitter_data(N_EMITTERS, cfg.samples_per_emitter, 0.0,
                                    cfg.noise_level, np.random.default_rng(cfg.eval_seed))
 

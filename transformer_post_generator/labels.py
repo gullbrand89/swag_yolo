@@ -2,18 +2,26 @@
 dict <-> tokens.
 
 Format (nivå- och längdcykel som separata block, oberoende perioder):
-  LEVELS N<n>  L0 N<bin>  L1 N<bin> ...
-  ORDER  FIXED L0 L2 L1   |  ORDER RANDOM
-  DWELL  FIXED N10 N5     |  DWELL RANGE N5 N12   (min, max)
+  LEVELS  L0 B<bin>  L1 B<bin> ...
+  ORDER   FIXED L0 L2 L1   |  ORDER RANDOM
+  DWELL   FIXED D10 D5     |  DWELL RANGE D5 D12   (min, max)
   END
-Längd: N<k> pulser eller INF (static).
+Längd: D<k> pulser eller INF (static).
+
+Nivåer och dwelltider har SKILDA tokenrymder, B respektive D. En bin är en mätning
+med ändlig noggrannhet, en dwelltid ett exakt antal -- de tål inte samma utjämning.
+
+Nivåblocket har INGET antalstoken. Antalet är redundant -- nivånamn och ORDER är
+disjunkta tokenklasser, så parsern läser par tills den ser ORDER. Ett explicit antal
+var dessutom det fält modellen var sämst på, och ett fel i det gjorde hela posten
+otolkbar vid avkodning även när alla nivåer var rätt.
 
 RANGE används bara när intervallet har bredd. Ett nollbrett intervall beskriver samma
 emitter som en fast dwell och normaliseras till DWELL FIXED, så att en emitter aldrig
 kan ha två giltiga facit.
 """
-from config import cfg
-from vocab import LEVEL_NAMES, TOK2ID, bin_of, pri_of_bin
+from .config import cfg
+from .vocab import LEVEL_NAMES, TOK2ID, bin_of, pri_of_bin
 
 
 def _min_period(x):
@@ -31,7 +39,7 @@ def _rot(x):
     return x[r:] + x[:r]
 
 def _L(n):
-    return "INF" if n is None else f"N{int(n)}"
+    return "INF" if n is None else f"D{int(n)}"
 
 
 def to_tokens(levels, lengths, order_fixed, length_fixed, compress_lengths=None):
@@ -99,9 +107,9 @@ def to_tokens(levels, lengths, order_fixed, length_fixed, compress_lengths=None)
         order_fixed = True
         seq = [name[b] for b in uniq]
 
-    t = ["LEVELS", f"N{len(uniq)}"]
+    t = ["LEVELS"]
     for b in uniq:
-        t += [name[b], f"N{b}"]
+        t += [name[b], f"B{b}"]
 
     # ---- reducera cyklerna till minsta period
     seq_min = _min_period(seq)
@@ -135,7 +143,7 @@ def to_tokens(levels, lengths, order_fixed, length_fixed, compress_lengths=None)
         # självmotsägande facit. Bättre att smälla än att skicka nonsens till modellen.
         assert lengths, "DWELL RANGE utan längder"
         assert None not in lengths, f"DWELL RANGE kan inte innehålla INF: {lengths}"
-        t += ["DWELL", "RANGE", f"N{min(lengths)}", f"N{max(lengths)}"]
+        t += ["DWELL", "RANGE", f"D{min(lengths)}", f"D{max(lengths)}"]
 
     t += ["END"]
 
@@ -150,20 +158,28 @@ def parse(tokens):
     def nxt():
         try: return next(it)
         except StopIteration: raise ValueError("oväntat slut")
-    def num(tok):
-        if not (tok.startswith("N") and tok[1:].isdigit()): raise ValueError(f"väntade tal, fick {tok}")
+    def bin_num(tok):
+        if not (tok.startswith("B") and tok[1:].isdigit()):
+            raise ValueError(f"väntade nivåbin, fick {tok}")
         return int(tok[1:])
-    def length(tok): return None if tok == "INF" else num(tok)
+    def dur_num(tok):
+        if not (tok.startswith("D") and tok[1:].isdigit()):
+            raise ValueError(f"väntade dwelltid, fick {tok}")
+        return int(tok[1:])
+    def length(tok): return None if tok == "INF" else dur_num(tok)
     def is_level(tok): return tok.startswith("L") and tok[1:].isdigit()
 
     if nxt() != "LEVELS": raise ValueError("saknar LEVELS")
-    n = num(nxt()); name2pri = {}
-    for _ in range(n):
-        lvl = nxt()
-        if not is_level(lvl): raise ValueError(f"väntade nivånamn, fick {lvl}")
-        name2pri[lvl] = pri_of_bin(num(nxt()))
+    # Inget antalstoken: läs (nivånamn, bin)-par tills ORDER dyker upp. Nivånamn och
+    # ORDER är disjunkta tokenklasser, så avgränsningen är entydig.
+    name2pri = {}
+    tok = nxt()
+    while is_level(tok):
+        name2pri[tok] = pri_of_bin(bin_num(nxt()))
+        tok = nxt()
+    if not name2pri: raise ValueError("tom nivådefinition")
 
-    if nxt() != "ORDER": raise ValueError("saknar ORDER")
+    if tok != "ORDER": raise ValueError(f"väntade ORDER, fick {tok}")
     ot = nxt(); order, lengths = [], []
     order_fixed = length_fixed = None
     tok = nxt()

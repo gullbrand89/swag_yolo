@@ -95,5 +95,5 @@ def main(run):
 
 
 if __name__ == "__main__":
-    from config import cfg
+    from transformer_post_generator.config import cfg
     main(sys.argv[1] if len(sys.argv) > 1 else newest(cfg.run_root))

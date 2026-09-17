@@ -18,12 +18,12 @@ Nyckeltal
   krävt fönster          2 * antal nivåer * mediandwell -- ungefär vad som behövs för
                          att se cykeln två varv
 """
-import importlib
 
 import numpy as np
 
-from config import cfg
-from vocab import bin_of
+from transformer_post_generator import emitter_module
+from transformer_post_generator.config import cfg
+from transformer_post_generator.vocab import bin_of
 
 N_EMITTERS = 200
 
@@ -51,7 +51,7 @@ def pct(x, q):
 
 
 def main():
-    gen = importlib.import_module(cfg.emitter)
+    gen = emitter_module()
     data = gen.create_emitter_data(N_EMITTERS, cfg.samples_per_emitter, 0.0,
                                    cfg.noise_level, np.random.default_rng(cfg.eval_seed))
 

@@ -21,11 +21,11 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset, get_worker_info
 
-from config import cfg
-from vocab import safe_ids, PAD, BOS, EOS
-from labels import to_tokens
+from .vocab import safe_ids, PAD, BOS, EOS
+from .labels import to_tokens
 
-_emitter = importlib.import_module(cfg.emitter)
+from .config import cfg
+_emitter = importlib.import_module(cfg.emitter,package=__package__)
 create_emitter_data = _emitter.create_emitter_data
 detect_missing = getattr(_emitter, "detect_missing", None)
 
@@ -88,9 +88,9 @@ def as_signals(seqs):
     return [a] if a.ndim == 1 else [row for row in a]
 
 
-def make_pairs(rng, n_emitters=1, p_drop=None, **kw):
+def make_pairs(rng, n_emitters=1, p_drop=None, samples=None, **kw):
     """-> lista av (channels, tokens), en post per signal."""
-    data = create_emitter_data(n_emitters, cfg.samples_per_emitter, p_drop,
+    data = create_emitter_data(n_emitters, samples or cfg.samples_per_emitter, p_drop,
                                cfg.noise_level, rng, **kw)
     out = []
     for seqs, label in data:
@@ -117,12 +117,15 @@ class StreamDataset(Dataset):
         if self.rng is None:
             w = get_worker_info()
             self.rng = np.random.default_rng([self.seed, w.id if w else 0])
-        return make_pairs(self.rng)
+        p = float(self.rng.uniform(0, cfg.p_drop)) if cfg.randomize_p_drop else cfg.p_drop
+        return make_pairs(self.rng, p_drop=p)
 
 
 def make_eval_sets():
     """Samma emittrar OCH samma signaler i varje bortfallsvariant."""
-    return {f"drop_{p:.2f}": make_pairs(np.random.default_rng(cfg.eval_seed), cfg.eval_n_emitters, p)
+    return {f"drop_{p:.2f}": make_pairs(np.random.default_rng(cfg.eval_seed),
+                                       cfg.eval_n_emitters, p,
+                                       samples=cfg.eval_samples_per_emitter)
             for p in cfg.eval_p_drops}
 
 

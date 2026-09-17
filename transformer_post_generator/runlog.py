@@ -5,8 +5,9 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-from vocab import ids_to_tokens
-from labels import parse
+from .config import cfg
+from .vocab import ids_to_tokens
+from .labels import parse
 
 
 def compare(pred, true, tol_us=2.0):
@@ -40,14 +41,14 @@ def compare(pred, true, tol_us=2.0):
 
 
 @torch.no_grad()
-def evaluate(model, eval_sets, device, collate, run=None, batch=128):
+def evaluate(model, eval_sets, device, collate, run=None, batch=256, max_new=None):
     model.eval(); results = {}
     for name, pairs in eval_sets.items():
         loader = DataLoader(pairs, batch_size=batch, shuffle=False, collate_fn=collate)
         rows, preds = [], []
         for src, _, tgt_out in loader:
             src = {k: v.to(device) for k, v in src.items()}
-            out = model.greedy(src).cpu()
+            out = model.greedy(src, max_new=max_new or cfg.eval_max_new).cpu()
             for i in range(out.size(0)):
                 pt, tt = ids_to_tokens(out[i]), ids_to_tokens(tgt_out[i])
                 rows.append(compare(pt, tt)); preds.append((tt, pt))

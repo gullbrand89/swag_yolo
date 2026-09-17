@@ -10,6 +10,7 @@ fel som annars kostar en hel körning innan de märks:
   1. facitet överlever rundturen to_tokens -> parse -> to_tokens
   2. facitet beskriver faktiskt sin egen signal (verify)
   3. en emitter har exakt ETT facit -- likvärdiga beskrivningar kanoniseras lika
+     (nivåblocket har inget antalstoken: par läses tills ORDER dyker upp)
   4. binningen är konsekvent mellan vocab.py och data.py, och täcker datan
   5. samma seed ger samma emittrar OCH samma signaler för alla bortfallsnivåer
   6. en batch går genom modell, loss och avkodning och ger ändliga tal (kräver torch)
@@ -20,11 +21,11 @@ import sys
 
 import numpy as np
 
-from config import cfg
-from data import create_emitter_data
-from labels import roundtrip_ok, to_tokens
-from verify import verify_label
-from vocab import in_bin_of, in_cont_of, pri_of_bin
+from transformer_post_generator.config import cfg
+from transformer_post_generator.data import create_emitter_data
+from transformer_post_generator.labels import roundtrip_ok, to_tokens
+from transformer_post_generator.verify import verify_label
+from transformer_post_generator.vocab import in_bin_of, in_cont_of, pri_of_bin
 
 FAIL = []
 
@@ -37,6 +38,11 @@ def check(name, ok, detail=""):
 
 def tok(lab):
     return to_tokens(lab["levels"], lab["lengths"], lab["order_fixed"], lab["length_fixed"])
+
+
+def _n_levels(t):
+    """Antal nivåer, nu när antalstoken är borta: (L, bin)-par mellan LEVELS och ORDER."""
+    return (t.index("ORDER") - 1) // 2
 
 
 def gen(n_emitters, n_signals=1, p_drop=0.0, seed=0):
@@ -77,9 +83,50 @@ def test_labels(n=400):
                                   l["length_fixed"]) for _, l in data)
     check("rundtur to_tokens -> parse -> to_tokens", bad_rt == 0, f"{bad_rt}/{n} fel")
 
-    ok = sum(verify_label(s, l, verbose=False)["ok"] for seqs, l in data for s in seqs)
-    tot = sum(len(s) for s, _ in data)
+    reps = [verify_label(s, l, verbose=False) for seqs, l in data for s in seqs]
+    tot = len(reps)
+
+    # Facitet är FEL om signalen visar något det inte har. Det får aldrig hända.
+    dikt = sum(1 for r in reps if r["levels"]["extra_in_signal"])
+    check("facit hittar inte på nivåer", dikt == 0, f"{dikt}/{tot} med extra nivåer")
+
+    ok = sum(r["ok"] for r in reps)
     check("facit beskriver sin signal", ok / tot >= 0.99, f"{ok}/{tot} = {ok/tot:.1%}")
+
+    # Facitet kan vara rätt utan att fönstret visar allt. Det är ett tak, inte ett
+    # fel, och det hör hemma i utskriften snarare än i ett godkänt/underkänt.
+    dolt = sum(1 for r in reps if r["levels"]["unobserved"])
+    print(f"       observerbarhetstak: {tot - dolt}/{tot} = {1 - dolt / tot:.1%} av "
+          f"signalerna visar varenda nivå i facitet")
+
+
+def test_volym(n=50000):
+    """
+    Bara emitterdragning + facitbygge, inga signaler. Snabbt nog att köra många.
+
+    Varför så många: test_labels kör 400 emittrar, och en generatorbugg som slår
+    i 0.01 % av dragningarna syns då i ett fall av tjugofem körningar. Samma bugg
+    kraschar en träning inom några tusen steg, eftersom en körning drar
+    hundratusentals emittrar. Testet måste dra i samma storleksordning som
+    träningen, annars mäter det ingenting.
+
+    Den här upptäcker ett fel med sannolikhet 1 % i ungefär 99 % av körningarna.
+    """
+    from transformer_post_generator.all_emitters import GEN, VARIANTS, _make_emitter
+
+    print(f"\n1b) volym: {n} emittrar, bara facitbygge")
+    rng = np.random.default_rng(12345)
+    w = np.array([GEN.weights[v] for v in VARIANTS], dtype=float)
+    w = w / w.sum()
+    fel = []
+    for _ in range(n):
+        v = VARIANTS[int(rng.choice(len(VARIANTS), p=w))]
+        try:
+            to_tokens(*_make_emitter(v, rng))
+        except Exception as e:
+            fel.append(f"{v}: {type(e).__name__} {e}")
+    check("facit går att bygga för varje emitter", not fel,
+          f"{len(fel)}/{n} fel" + (f" -- {fel[0][:120]}" if fel else ""))
 
 
 # ------------------------------------------------------------------ 3
@@ -123,6 +170,29 @@ def test_canonical(n=300):
     check("rotation av cykeln ger samma facit", bad is None,
           "" if bad is None else f"\n        {' '.join(bad[0])}\n        {' '.join(bad[1])}")
 
+    # Med en eller två nivåer är ordningen inte observerbar: en omedelbar upprepning
+    # smälter ihop med föregående besök, så följden alternerar alltid. RANDOM och
+    # FIXED beskriver då samma emitter och måste ge samma facit.
+    for k, lab in ((2, (0.3, 0.7)), (1, (0.4,))):
+        dw = [6] if k == 2 else [None]
+        a = to_tokens(_levels(*lab), dw, False, True)
+        b = to_tokens(_levels(*lab), dw, True, True)
+        check(f"{k} nivåer: ORDER RANDOM == ORDER FIXED", a == b,
+              "" if a == b else f"\n        {' '.join(a)}\n        {' '.join(b)}")
+
+    # ...men med tre nivåer ÄR ordningen observerbar och får inte slås ihop
+    a = to_tokens(_levels(0.2, 0.5, 0.8), [4], False, True)
+    b = to_tokens(_levels(0.2, 0.5, 0.8), [4], True, True)
+    check("3 nivåer: RANDOM och FIXED hålls isär", a != b)
+
+    # en påtvingad ordning vet inget om vilken längd som hör till vilken nivå, och
+    # får inte hitta på en koppling som generatorn aldrig uppgav
+    a = to_tokens(_levels(0.3, 0.7), [8, 5], False, True)
+    b = to_tokens(_levels(0.3, 0.7), [8, 5], True, True)
+    check("påtvingad ordning kopplar inte nivå till längd", a != b,
+          f"\n        RANDOM {' '.join(a[a.index('DWELL'):])}"
+          f"\n        FIXED  {' '.join(b[b.index('DWELL'):])}")
+
     # INF betyder "lämnar aldrig nivån" och går inte att uttrycka som ett intervall.
     # Ett RANGE med INF är självmotsägande och ska smälla, inte tyst tappa fältet.
     try:
@@ -144,6 +214,10 @@ def test_canonical(n=300):
     check("inga nollbredda RANGE i facitet", kvar == 0,
           f"{kvar}/{len(data)} kvar, {both} kandidater i generatorns utdata")
 
+    rnd = sum(1 for _, l in data if "RANDOM" in tok(l) and _n_levels(tok(l)) <= 2)
+    check("inga ORDER RANDOM med färre än tre nivåer", rnd == 0,
+          f"{rnd}/{len(data)} kvar")
+
 
 # ------------------------------------------------------------------ 4
 def test_binning(n=200):
@@ -152,7 +226,7 @@ def test_binning(n=200):
     inputbinningen), och att nivåer utanför pri_min/pri_max klipps tyst in i
     kant-binen så att olika emittrar får identiska tokens.
     """
-    from data import make_channels
+    from transformer_post_generator.data import make_channels
     print("\n4) binning")
 
     p = np.concatenate([np.geomspace(max(cfg.in_min, 1e-6), cfg.in_max * 0.999, 400),
@@ -238,10 +312,10 @@ def test_model():
         print("  --   torch saknas, hoppar över")
         return
 
-    from data import StreamDataset, collate
-    from loss import loss_by_field, loss_fn
-    from model import build_model
-    from vocab import EOS, PAD, ids_to_tokens
+    from transformer_post_generator.data import StreamDataset, collate
+    from transformer_post_generator.loss import loss_by_field, loss_fn
+    from transformer_post_generator.model import build_model
+    from transformer_post_generator.vocab import EOS, PAD, ids_to_tokens
 
     ds = StreamDataset(4, 0)
     src, tgt_in, tgt_out = collate([ds[i] for i in range(2)])
@@ -292,6 +366,7 @@ if __name__ == "__main__":
           f"n_bins={cfg.n_bins}  in_bins={cfg.in_bins}")
     test_contract()
     test_labels()
+    test_volym()
     test_canonical()
     test_binning()
     test_determinism()

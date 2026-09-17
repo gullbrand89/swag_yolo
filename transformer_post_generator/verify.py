@@ -18,9 +18,9 @@ Tar hänsyn till två saker som annars ger falsklarm:
 """
 import numpy as np
 
-from config import cfg
-from vocab import bin_of, pri_of_bin
-from labels import parse
+from .config import cfg
+from .vocab import bin_of, pri_of_bin
+from .labels import parse
 
 
 # ------------------------------------------------------------------ hjälp
@@ -81,10 +81,16 @@ def _best_rotation(obs, cycle):
 
 
 # ------------------------------------------------------------------ verifiering
-def verify_label(pri, label, tol_bins=1, min_pulses=3, trim_edges=True, verbose=True):
+def verify_label(pri, label, tol_bins=1, min_pulses=1, trim_edges=True, verbose=True):
     """
     Returnerar en dict med en post per kontroll: {"ok": bool, ...detaljer}.
+
     min_pulses : bins med färre pulser än så räknas som artefakter, inte nivåer.
+        Var 3 tidigare, vilket var säkert när varje dwell var minst 4 pulser lång.
+        Med lim_ds_k = [1, 32] är en dwell på 1-2 pulser fullt laglig, och ett besök
+        som kapas av fönsterkanten lämnar lika få. Tröskeln kastade då bort äkta
+        nivåer och rapporterade facitet som fel. Höj den bara om du har brus eller
+        en detektor som hittar på bins.
     trim_edges : hoppa över första och sista dwellen vid längdkontrollen.
     """
     lab = _as_label(label)
@@ -106,11 +112,20 @@ def verify_label(pri, label, tol_bins=1, min_pulses=3, trim_edges=True, verbose=
         else:
             extra.append(b)
     missing = [lb for lb in lvl_uniq if not any(abs(b - lb) <= tol_bins for b in strong)]
+    # Två helt olika saker, som inte får blandas ihop:
+    #   extra   signalen visar en nivå som facitet inte har -> facitet är FEL
+    #   missing facitet har en nivå som fönstret aldrig visar -> facitet är rätt,
+    #           men den här observationen räcker inte för att bekräfta det
+    # Bara det första gör facitet ogiltigt. Det andra är observerbarhetstaket, och
+    # att räkna det som fel gör att testet mäter fönstrets längd i stället för
+    # facitets riktighet.
     rep["levels"] = dict(
-        ok=not extra and not missing,
+        ok=not extra,
+        ok_complete=not extra and not missing,
         n_label=len(lvl_uniq), n_signal=len(strong),
         label_bins=lvl_uniq, signal_bins=strong,
         extra_in_signal=extra, missing_in_signal=missing,
+        unobserved=missing,
         weak_bins=weak)
 
     # ---- besök

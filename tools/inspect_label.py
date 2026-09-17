@@ -5,8 +5,8 @@ Användning i notebook:
 
     from inspect_label import plot_label, simulate_from_label
     import numpy as np
-    from data import create_emitter_data
-    from labels import to_tokens
+    from transformer_post_generator.data import create_emitter_data
+    from transformer_post_generator.labels import to_tokens
 
     data = create_emitter_data(4, 1, 0.0, None, np.random.default_rng(0))
     seqs, lab = data[0]
@@ -22,8 +22,8 @@ import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
-from labels import parse
-from vocab import bin_of, pri_of_bin
+from transformer_post_generator.labels import parse
+from transformer_post_generator.vocab import bin_of, pri_of_bin
 
 
 # ------------------------------------------------------------------ simulering

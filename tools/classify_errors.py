@@ -33,9 +33,9 @@ import sys
 from collections import Counter
 from pathlib import Path
 
-from config import cfg
-from labels import parse
-from vocab import bin_of
+from transformer_post_generator.config import cfg
+from transformer_post_generator.labels import parse
+from transformer_post_generator.vocab import bin_of
 
 
 def read_preds(path):

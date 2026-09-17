@@ -19,14 +19,14 @@ Kontrollerna
 
 Körs med drop = 0, annars slås besök ihop av bortfall.
 """
-import importlib
 from collections import Counter
 
 import numpy as np
 
-from config import cfg
-from labels import _min_period
-from vocab import bin_of
+from transformer_post_generator import emitter_module
+from transformer_post_generator.config import cfg
+from transformer_post_generator.labels import _min_period
+from transformer_post_generator.vocab import bin_of
 
 N_EMITTERS = 200
 MAX_PERIOD = 8          # längsta längdcykel vi letar efter
@@ -62,7 +62,7 @@ def period_of(xs, max_p=MAX_PERIOD):
 
 
 def main():
-    gen = importlib.import_module(cfg.emitter)
+    gen = emitter_module()
     data = gen.create_emitter_data(N_EMITTERS, cfg.samples_per_emitter, 0.0,
                                    cfg.noise_level, np.random.default_rng(cfg.eval_seed))
 

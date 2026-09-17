@@ -15,9 +15,9 @@ from collections import Counter
 
 import numpy as np
 
-from vocab import bin_of
-from labels import to_tokens, parse
-from verify import (verify_label, _as_label, _quantize, _visits,
+from .vocab import bin_of
+from .labels import to_tokens, parse
+from .verify import (verify_label, _as_label, _quantize, _visits,
                     _min_period, _best_rotation)
 
 from data import create_emitter_data          # följer cfg.emitter

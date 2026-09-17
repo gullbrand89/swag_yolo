@@ -23,7 +23,15 @@ class Config:
     max_levels: int = 32
     max_dur: int = 32             # största dwelltid i pulser. 1023 täcker allt när
                                     # fönstret är 1024 pulser -- höj om fönstret växer
-    sigma_bin: float = 1.0          # utjämning på nivåbins, i bins
+    # Bredden på den ordinala utjämningen för nivåbins. Vid 1.0 lägger målet bara
+    # 0.399 på rätt bin och 0.242 på vardera grannen -- modellen belönas alltså för
+    # att tveka ±1 bin, och det syns i predikterna: nivåblocket är rätt inom ±1 i
+    # 53% av posterna men teckenidentiskt i 18%. Facitets bin är exakt, så
+    # utjämningen är ett inlärningsstöd och inte en brusmodell. Vid 0.5 blir det
+    # 0.787 på rätt bin.
+    # OBS: golvet för loss_num faller från 1.19 till 0.67 nat enbart av det här.
+    # loss_num går alltså ner ~0.52 gratis och är INTE jämförbar med förra körningen.
+    sigma_bin: float = 0.5
     sigma_dur: float = 0.5          # utjämning på dwelltider, i pulser
     max_run: int = 64               # räknarens tak
     compress_lengths: bool = True   # [10,10,10] -> [10] i facit
@@ -73,13 +81,17 @@ class Config:
     lr: float = 3e-4
     warmup: int = 500
     weight_decay: float = 0.01
-    clip: float = 4.0               # gradientklippning; 0 = av. En tröskel klart under
+    # Säkerhetsventil, inte en del av optimeraren. Vid 4.0 löste den ut på 0.95% av
+    # stegen och p99 låg på 3.96 -- alltså vid kanten. Ett skarpare mål ger större
+    # gradienter, så 4.0 skulle riskera att bli aktivt och återinföra just den
+    # stegrande lossen vi felsökte bort. Mät om med grad_norm i loggen.
+    clip: float = 8.0
                                     # den typiska gradientnormen gör klippningen aktiv
                                     # varje steg och frikopplar stegstorleken från
                                     # lr -- det var orsaken till den stigande lossen.
                                     # Logga grad_norm och sätt ~5 x medianen.
     struct_weight: float = 0.5      # lossvikt på strukturtokens
-    smooth_width: int = 3           # fönstret för utjämningen; >= 3 x sigma
+    smooth_width: int = 2           # fönstret för utjämningen; >= 3 x sigma
     seed: int = 0
     num_workers: int = 16
     eval_every: int = 2000

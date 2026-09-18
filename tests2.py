@@ -317,6 +317,12 @@ def _well_formed(row, EOS, PAD):
     e = (t == EOS).nonzero()
     cut = int(e[0, 0]) if e.numel() else t.numel()
     return not bool((t[:cut] == PAD).any())
+    
+b = open("runs/<tidsstämpel>/preds_drop_0.00.txt").read().strip().split("\n\n")
+lvl = lambda s: s.split()[1:s.split().index("ORDER")]
+ok = [lvl(x.split("\n")[0]) == lvl(x.split("\n")[1]) for x in b if x.count("ORDER") == 2]
+print(sum(ok) / len(b))
+
 
 
 # ------------------------------------------------------------------

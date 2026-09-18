@@ -6,6 +6,10 @@ SFT: cross-entropy mot facit med teacher forcing.
 
 Generator väljs med cfg.emitter, allt annat i config.py. Kör grpo.py efteråt för
 RL-fasen; den startar från checkpointen den här skriver.
+
+Med cfg.aux_weight > 0 optimeras postens loss plus en hjälp-loss på encodern (se
+loss.aux_loss). I loggen är `loss` fortfarande postens loss, jämförbar med äldre
+körningar; `loss_total` är det som faktiskt optimeras.
 """
 import argparse
 import math
@@ -20,9 +24,13 @@ from torch.utils.data import DataLoader
 from .config import cfg
 from .data import StreamDataset, collate, create_emitter_data, make_eval_sets
 from .labels import roundtrip_ok
-from .loss import loss_by_field, loss_fn
+from .loss import aux_loss, loss_by_field, loss_fn
 from .model import build_model
 from .runlog import RunLog, evaluate
+
+
+_AUX_COLS = ("loss_aux", "aux_new_acc", "aux_new_recall", "aux_pos_acc",
+             "aux_merge_acc", "aux_merge_recall")
 
 
 def sanity_checks(n=500):
@@ -72,8 +80,19 @@ def main():
         src = {k: v.to(device) for k, v in src.items()}
         tgt_in, tgt_out = tgt_in.to(device), tgt_out.to(device)
 
-        logits = model(src, tgt_in)
-        loss = loss_fn(logits, tgt_out)
+        # loss_post är samma storhet som `loss` i tidigare körningar. Den loggas under
+        # det namnet även nu, så att kurvorna går att lägga på varandra; det som
+        # optimeras är loss_total.
+        aux_stats = {}
+        if cfg.aux_weight > 0:
+            logits, aux = model(src, tgt_in, return_aux=True)
+            loss_post = loss_fn(logits, tgt_out)
+            loss_aux, aux_stats = aux_loss(aux, src)
+            loss = loss_post + cfg.aux_weight * loss_aux
+            aux_stats = dict(loss_aux=loss_aux.item(), **aux_stats)
+        else:
+            logits = model(src, tgt_in)
+            loss = loss_post = loss_fn(logits, tgt_out)
         opt.zero_grad(set_to_none=True); loss.backward()
         gn = nn.utils.clip_grad_norm_(
             model.parameters(), cfg.clip if cfg.clip > 0 else float("inf"))
@@ -87,12 +106,24 @@ def main():
             # är klippningen aktiv varje steg och sätter stegstorleken i stället för lr.
             with torch.no_grad():
                 wn = sum(float(p.norm()) ** 2 for p in model.parameters()) ** 0.5
-            run.log(step=step, loss=loss.item(), loss_num=ln, loss_order=lo,
+            # Kolumnerna måste vara desamma varje rad (csv.DictWriter låser dem vid
+            # första raden), så recall-måtten fylls med nan när en batch råkar sakna
+            # positiva exempel.
+            aux_cols = {}
+            if cfg.aux_weight > 0:
+                aux_cols = {k: aux_stats.get(k, float("nan")) for k in _AUX_COLS}
+            run.log(step=step, loss=loss_post.item(), loss_num=ln, loss_order=lo,
                     loss_grammar=lg, grad_norm=float(gn),
                     logit_max=float(logits.detach().abs().max()), weight_norm=wn,
-                    lr=sched.get_last_lr()[0])
-            print(f"step {step:6d}  loss {loss.item():.4f}  num {ln:.4f}  order {lo:.4f}  "
-                  f"grammar {lg:.4f}  |g| {float(gn):.2f}  {time.time()-t0:.0f}s")
+                    lr=sched.get_last_lr()[0], loss_total=loss.item(), **aux_cols)
+            aux_txt = ""
+            if cfg.aux_weight > 0:
+                aux_txt = (f"  aux {aux_cols['loss_aux']:.3f} "
+                           f"(nytt {aux_cols['aux_new_recall']:.2f} "
+                           f"pos {aux_cols['aux_pos_acc']:.2f} "
+                           f"tapp {aux_cols['aux_merge_recall']:.2f})")
+            print(f"step {step:6d}  loss {loss_post.item():.4f}  num {ln:.4f}  order {lo:.4f}  "
+                  f"grammar {lg:.4f}{aux_txt}  |g| {float(gn):.2f}  {time.time()-t0:.0f}s")
 
         if step % cfg.eval_every == 0 or step >= args.steps:
             run.log_eval(step, evaluate(model, eval_sets, device, collate, run))

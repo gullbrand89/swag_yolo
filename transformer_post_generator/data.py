@@ -14,8 +14,14 @@ Samma rng-seed ska ge samma emittrar OCH samma signaler oavsett drop_rate/noise_
 all_emitters gör det med tre separata strömmar (emitter / signal / bortfall).
 
 Valfritt:  detect_missing(pri_obs) -> bool-array, från din missing-pulse-detektor.
+
+Valfritt:  create_emitter_data(..., with_aux=True) lägger facit per puls i
+           label["aux"] (en dict per signal med new, pos, merge). Används av
+           hjälp-lossen när cfg.aux_weight > 0. En generator som saknar parametern
+           fungerar ändå: målen fylls då med AUX_IGNORE och hjälp-lossen blir noll.
 """
 import importlib
+import inspect
 
 import numpy as np
 import torch
@@ -28,6 +34,10 @@ from .config import cfg
 _emitter = importlib.import_module(cfg.emitter,package=__package__)
 create_emitter_data = _emitter.create_emitter_data
 detect_missing = getattr(_emitter, "detect_missing", None)
+
+AUX_IGNORE = -100          # ignore_index i loss.aux_loss; även utfyllnad i _pack
+_AUX = ("aux_new", "aux_pos", "aux_merge")
+_AUX_OK = "with_aux" in inspect.signature(create_emitter_data).parameters
 
 
 def label_to_tokens(label):
@@ -48,7 +58,8 @@ def run_length(bins, flags=None):
     return rl
 
 
-def make_channels(pri_obs):
+def make_channels(pri_obs, aux=None):
+    """aux : dict med new/pos/merge från generatorn, eller None (-> ignoreras i lossen)."""
     p = np.asarray(pri_obs, dtype=float)
     if p.ndim != 1:
         raise ValueError(
@@ -68,9 +79,21 @@ def make_channels(pri_obs):
     rl = run_length(bins, flags) if cfg.use_counter else np.zeros(len(bins), dtype=np.int64)
     flag = flags.astype(np.int64) if flags is not None else np.zeros(len(bins), dtype=np.int64)
 
+    # Facit till hjälp-lossen. Det är MÅL, inte input: modellen läser aldrig de här
+    # nycklarna (InputEmbedding tar bara bins, cont, rl, flag), de följer bara med i
+    # src-dicten för att hamna på samma device som resten.
+    ch_aux = {}
+    for k in _AUX:
+        a = None if aux is None else aux.get(k[4:])
+        if a is None:
+            a = np.full(len(p), AUX_IGNORE, dtype=np.int64)
+        a = np.asarray(a, dtype=np.int64)
+        assert len(a) == len(p), f"{k}: {len(a)} mål för {len(p)} pulser"
+        ch_aux[k] = a
+
     # pri följer med rå: RL-belöningen mäter mot signalen, inte mot facitet
     return dict(bins=bins, cont=cont, toa=toa, rl=rl, flag=flag,
-                pri=p.astype(np.float32))
+                pri=p.astype(np.float32), **ch_aux)
 
 
 _CHANNELS = ("bins", "cont", "toa", "rl", "flag")
@@ -90,13 +113,17 @@ def as_signals(seqs):
 
 def make_pairs(rng, n_emitters=1, p_drop=None, samples=None, **kw):
     """-> lista av (channels, tokens), en post per signal."""
+    if cfg.aux_weight > 0 and _AUX_OK:
+        kw = dict(kw, with_aux=True)
     data = create_emitter_data(n_emitters, samples or cfg.samples_per_emitter, p_drop,
                                cfg.noise_level, rng, **kw)
     out = []
     for seqs, label in data:
         tokens = label_to_tokens(label)
-        for s in as_signals(seqs):          # en signal i taget, aldrig hela arrayen
-            out.append((make_channels(s), tokens))
+        sigs = as_signals(seqs)
+        auxs = label.get("aux") or [None] * len(sigs)
+        for s, a in zip(sigs, auxs):        # en signal i taget, aldrig hela arrayen
+            out.append((make_channels(s, a), tokens))
     return out
 
 class StreamDataset(Dataset):
@@ -151,10 +178,12 @@ def _pack(flat):
         flag=torch.zeros(B, T, dtype=torch.long),
         mask=torch.ones(B, T, dtype=torch.bool),
     )
+    for k in _AUX:                                      # utfyllnad = ignoreras i lossen
+        src[k] = torch.full((B, T), AUX_IGNORE, dtype=torch.long)
     tgt = torch.full((B, L), PAD, dtype=torch.long)
     for i, (ch, _) in enumerate(flat):
         n = len(ch["bins"])
-        for k in _CHANNELS:
+        for k in _CHANNELS + _AUX:
             src[k][i, :n] = torch.as_tensor(ch[k])
         src["mask"][i, :n] = False
         tgt[i, :len(tg[i])] = torch.tensor(tg[i])

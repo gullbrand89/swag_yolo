@@ -15,7 +15,11 @@ class Config:
     pri_max: float = 505.0
     n_bins: int = 2048              # facitets binning, linjär (0.2462 µs/bin)
     in_min: float = 0.98            # observationsrymd (input)
-    in_max: float = 1010.0          # ~2 x pri_max: marginal för ihopslagna pulser
+    # in_max måste hållas EXAKT på in_min + (in_bins-2)/(n_bins-1) * (pri_max-pri_min).
+    # Då är binbredderna identiska och input-bin == facit-bin för samma PRI. Med 1010.0
+    # var inputbinen 0.1 % bredare, kanterna gled isär två hela bins över rymden och
+    # ett exakt nivåblock fick ett tak på ~25 %. tests.py (4) vaktar detta.
+    in_max: float = 1009.02         # ~2 x pri_max: marginal för ihopslagna pulser
     in_bins: int = 4096             # inputens binning, LINJÄR (inte log)
     toa_scale: float = 143.43        # µs per positionsenhet ~ korpusens medel-PRI
 
@@ -56,7 +60,7 @@ class Config:
     # mellan emittrar dominerar, så de kostar fyra gånger avkodningen utan att minska
     # standardfelet. Augmentering hör hemma i träningen, inte i mätningen.
     eval_samples_per_emitter: int = 1
-    eval_n_emitters: int = 200
+    eval_n_emitters: int = 1000     # 200 gav ett standardfel på ~2.3 procentenheter på exact
     # Greedy kör annars max_tgt-1 = 255 steg. Längsta facit på 30000 emittrar är 89
     # token, och en enda rad som aldrig når EOS drar hela batchen till taket.
     eval_max_new: int = 112
@@ -74,6 +78,16 @@ class Config:
     max_tgt: int = 256
     max_src: int = 4096             # bara index-modellen
     time_frac: float = 0.5          # bara rope-modellen
+    qk_norm: bool = True            # QK-normalisering i encoderns attention (model.py)
+
+    # ---------------- hjälp-loss på encodern (se loss.aux_loss)
+    # Tre små huvuden per puls: "nytt besök?", "position i uppehållet" och "hur många
+    # verkliga pulser ryms i det här intervallet?". Facit kommer ur generatorn. Syftet
+    # är att encoderns representation ska bära besöksstrukturen, så att avkodaren kan
+    # läsa av ordning och uppehållstid i stället för att härleda dem från lösa pulser.
+    # 0 stänger av allt: inga huvuden byggs, inga mål genereras, och en checkpoint
+    # från en körning utan hjälp-loss går att ladda som vanligt.
+    aux_weight: float = 0.3
 
     # ---------------- träning (SFT, train.py)
     steps: int = 20000

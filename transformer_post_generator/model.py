@@ -18,6 +18,11 @@ src är dicten från collate (bins, cont, toa, rl, flag, mask).
     bfloat16 -- åtta mantissabitar, alltså ungefär tre decimalers precision på
     rotationen. Rotationen görs nu i fp32 och castas tillbaka.
 
+Hjälp-huvuden (cfg.aux_weight > 0): tre linjära lager på encoderns utdata som per puls
+svarar på "nytt besök?", "position i uppehållet" och "antal ihopslagna intervall".
+De används bara i träningen -- model(src, tgt_in, return_aux=True) -- och påverkar
+varken generate() eller greedy(). Se loss.aux_loss.
+
 Decodern använder nn.TransformerDecoderLayer och har ingen QK-normalisering. Den kör
 över ~40 token i stället för 1024 och är därför betydligt mindre utsatt; vill man ha
 det även där måste lagret skrivas för hand. Detsamma gäller IndexModel.
@@ -85,9 +90,29 @@ class Decoder(nn.Module):
         return self.out(h)
 
 
+class AuxHeads(nn.Module):
+    """Per-puls-huvuden på encoderns utdata. -> dict med logits (B, T, klasser)."""
+    def __init__(self, d):
+        super().__init__()
+        self.new = nn.Linear(d, 2)                     # nytt besök: nej / ja
+        self.pos = nn.Linear(d, cfg.max_dur + 1)       # position i uppehållet, 0..max_dur
+        self.merge = nn.Linear(d, 4)                   # 0, 1, 2, 3+ tappade pulser
+    def forward(self, mem):
+        return dict(new=self.new(mem), pos=self.pos(mem), merge=self.merge(mem))
+
+
+def _aux_heads(d):
+    return AuxHeads(d) if cfg.aux_weight > 0 else None
+
+
 class Base(nn.Module):
-    def forward(self, src, tgt_in):
-        return self.decoder(self.encode(src), src["mask"], tgt_in)
+    def forward(self, src, tgt_in, return_aux=False):
+        """return_aux=True -> (logits, aux), där aux är None om huvudena är avstängda."""
+        mem = self.encode(src)
+        logits = self.decoder(mem, src["mask"], tgt_in)
+        if not return_aux:
+            return logits
+        return logits, (self.aux(mem) if self.aux is not None else None)
 
     @torch.no_grad()
     def generate(self, src, n=1, greedy=True, temperature=1.0, top_k=0,
@@ -148,6 +173,7 @@ class IndexModel(Base):
                                            batch_first=True, norm_first=True)
         self.enc = nn.TransformerEncoder(layer, cfg.enc_layers, norm=nn.LayerNorm(d))
         self.decoder = Decoder(d)
+        self.aux = _aux_heads(d)
 
     def encode(self, src):
         x = self.inp(src) + self.pos_idx(src["bins"].size(1)) + self.pos_toa(src["toa"])
@@ -188,7 +214,7 @@ class RoPEAttention(nn.Module):
         # QK-norm håller attention-logitarna i schack. Utan den växer q·k med
         # qkv-vikternas norm, softmaxen kollapsar mot one-hot och gradienten genom
         # attention dör -- långsamt, och utan att bry sig om learning rate.
-        self.qk_norm = getattr(cfg, "qk_norm", True)
+        self.qk_norm = cfg.qk_norm
         if self.qk_norm:
             self.qn = nn.LayerNorm(self.dh)
             self.kn = nn.LayerNorm(self.dh)
@@ -227,6 +253,7 @@ class RoPEModel(Base):
                                      for _ in range(cfg.enc_layers)])
         self.norm = nn.LayerNorm(d)
         self.decoder = Decoder(d)
+        self.aux = _aux_heads(d)
 
     def encode(self, src):
         B, T = src["bins"].shape

@@ -324,6 +324,91 @@ def test_determinism():
     check("samma underliggande signal oavsett drop_rate", worst >= 0.99,
           f"sämsta träff {worst:.1%} i gemensamt tidsfönster, "
           f"{beyond:.1%} av den glesade ligger bortom den rena")
+# Klistra in i tests.py och anropa test_aux() i __main__-blocket, före test_model().
+# ------------------------------------------------------------------ 7
+def test_aux(n=200):
+    """
+    Hjälp-lossen på encodern. Fällorna:
+      * målen förskjuts mot pulserna vid bortfall -- då tränas encodern på brus
+      * att slå på målen ändrar signalerna (de får inte dra slumptal)
+      * utfyllnaden i batchen räknas med i lossen
+      * huvudena finns men får ingen gradient, eller stör den vanliga forward/greedy
+    """
+    from transformer_post_generator.data import collate, make_pairs
+    print(f"\n7) hjälp-loss (aux_weight = {cfg.aux_weight})")
+    if cfg.aux_weight <= 0:
+        print("  --   avstängd, hoppar över")
+        return
+
+    # ---- generatorn
+    for p in (0.0, 0.2):
+        a = create_emitter_data(n, 1, p, cfg.noise_level, np.random.default_rng(11))
+        b = create_emitter_data(n, 1, p, cfg.noise_level, np.random.default_rng(11),
+                                with_aux=True)
+        check(f"samma signaler med och utan mål (drop {p})",
+              all(np.array_equal(x[0][0], y[0][0]) for x, y in zip(a, b)))
+        langd = all(len(l["aux"][0][k]) == len(s[0]) for s, l in b for k in ("new", "pos", "merge"))
+        check(f"ett mål per observerad puls (drop {p})", langd)
+        tapp = np.concatenate([l["aux"][0]["merge"] for _, l in b])
+        check(f"andel ihopslagna intervall ~ drop_rate (drop {p})",
+              abs((tapp > 0).mean() - p) < 0.03, f"{(tapp > 0).mean():.3f}")
+        # utan bortfall ska 'new' sammanfalla med att PRI byter värde
+        if p == 0.0 and getattr(cfg, "noise_level", None) in (None, 0):
+            ok = all(np.array_equal(l["aux"][0]["new"][1:],
+                                    (np.diff(np.asarray(s[0])) != 0).astype(int))
+                     for s, l in b)
+            check("nytt besök == PRI byter värde (ren signal)", ok)
+
+    # ---- batchen
+    pairs = make_pairs(np.random.default_rng(12), n_emitters=8, p_drop=0.1)
+    src, tgt_in, tgt_out = collate(pairs)
+    pad = src["mask"]
+    check("utfyllnad har ignore-värdet",
+          all(bool((src[k][pad] == -100).all()) for k in ("aux_new", "aux_pos", "aux_merge")))
+    check("målen ryms i huvudenas klasser",
+          int(src["aux_new"].max()) <= 1 and int(src["aux_pos"].max()) <= cfg.max_dur
+          and int(src["aux_merge"].max()) <= 3)
+
+    # ---- modell och loss
+    try:
+        import torch
+        import torch.nn  # noqa: F401
+    except ImportError:
+        print("  --   torch saknas, hoppar över modelldelen")
+        return
+    from transformer_post_generator.loss import aux_loss, loss_fn
+    from transformer_post_generator.model import build_model
+
+    model = build_model()
+    check("modellen har hjälp-huvuden", model.aux is not None)
+    logits, aux = model(src, tgt_in, return_aux=True)
+    B, T = src["bins"].shape
+    check("huvudenas form är (B, T, klasser)",
+          aux["new"].shape == (B, T, 2) and aux["pos"].shape == (B, T, cfg.max_dur + 1)
+          and aux["merge"].shape == (B, T, 4))
+    check("vanlig forward ger fortfarande bara logits",
+          torch.is_tensor(model(src, tgt_in)))
+
+    la, stats = aux_loss(aux, src)
+    check("hjälp-lossen är ändlig", bool(torch.isfinite(la)),
+          f"{la.item():.3f}   " + "  ".join(f"{k} {v:.2f}" for k, v in stats.items()))
+
+    (loss_fn(logits, tgt_out) + cfg.aux_weight * la).backward()
+    g_head = float(model.aux.new.weight.grad.abs().sum())
+    check("gradienten når hjälp-huvudena", g_head > 0)
+
+    # gradienten från ENBART hjälp-lossen ska nå encodern -- det är hela poängen
+    model.zero_grad()
+    _, aux = model(src, tgt_in, return_aux=True)
+    aux_loss(aux, src)[0].backward()
+    g_enc = float(model.inp.bin.weight.grad.abs().sum())
+    g_dec = model.decoder.out.weight.grad
+    check("hjälp-lossen ensam ger gradient i encodern", g_enc > 0)
+    check("... men ingen i avkodaren", g_dec is None or float(g_dec.abs().sum()) == 0)
+
+    model.eval()
+    seq = model.greedy(src, max_new=8)
+    check("greedy opåverkad", seq.size(0) == B)
 
 
 # ------------------------------------------------------------------ 6

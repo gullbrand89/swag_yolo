@@ -219,16 +219,25 @@ def test_canonical(n=300):
           f"{rnd}/{len(data)} kvar")
 
 
-# ------------------------------------------------------------------ 4
-def test_binning(n=200):
+#
+def test_binning(n=1000):
     """
-    Två fällor: att vocab.py och data.py har glidit isär (de har varsin kopia av
-    inputbinningen), och att nivåer utanför pri_min/pri_max klipps tyst in i
-    kant-binen så att olika emittrar får identiska tokens.
+    Tre fällor:
+      * vocab.py och data.py har glidit isär (de har varsin kopia av inputbinningen)
+      * nivåer utanför pri_min/pri_max klipps tyst in i kant-binen, så att olika
+        emittrar får identiska tokens
+      * input- och facitbins ligger inte i linje. Är binbredderna inte EXAKT lika
+        glider kanterna isär över rymden, en inputbin täcker då två facitbins och
+        modellen kan inte veta vilket B-token som är rätt. Med in_max = 1010 var
+        skillnaden 0.1 % per bin -- två hela bins över rymden -- och det satte ett
+        tak på ~25 % för ett exakt nivåblock. Ett test med procenttolerans på
+        binbredden släpper igenom just det felet; därför jämförs binsen direkt.
     """
     from transformer_post_generator.data import make_channels
+    from transformer_post_generator.vocab import bin_of
     print("\n4) binning")
 
+    # ---- vocab.py mot data.py
     p = np.concatenate([np.geomspace(max(cfg.in_min, 1e-6), cfg.in_max * 0.999, 400),
                         [cfg.in_max, cfg.in_max * 2]])
     ch = make_channels(p)
@@ -237,16 +246,30 @@ def test_binning(n=200):
     check("vocab.py och data.py ger samma cont",
           bool(np.allclose(ch["cont"], [in_cont_of(x) for x in p], atol=1e-6)))
 
+    # ---- nivåerna ryms i facitrymden
     lv = np.concatenate([np.unique(np.asarray(l["levels"], dtype=float).ravel())
                          for _, l in gen(n)])
     out = ((lv < cfg.pri_min) | (lv > cfg.pri_max)).mean()
     check("alla nivåer ryms i pri_min..pri_max", out == 0,
           f"{out:.2%} klipps, spann {lv.min():.3f}–{lv.max():.3f} µs")
 
+    # ---- input-bin == facit-bin
     w_out = (cfg.pri_max - cfg.pri_min) / (cfg.n_bins - 1)
     w_in = (cfg.in_max - cfg.in_min) / (cfg.in_bins - 2)
-    check("inputen är minst lika fin som utdatan", w_in <= w_out * 1.01,
-          f"input {w_in:.4f} µs, utdata {w_out:.4f} µs")
+    ratt_in_max = cfg.in_min + (cfg.in_bins - 2) * w_out
+    check("binbredderna är identiska",
+          cfg.in_min == cfg.pri_min and abs(w_in - w_out) < 1e-9,
+          f"input {w_in:.6f} µs, facit {w_out:.6f} µs -> in_max ska vara {ratt_in_max:.4f}")
+
+    facit = np.array([bin_of(v) for v in lv])
+    diff_vocab = np.array([in_bin_of(v) for v in lv]) - facit
+    check("in_bin_of == bin_of för alla nivåer", bool((diff_vocab == 0).all()),
+          f"{(diff_vocab != 0).mean():.2%} avviker, max {np.abs(diff_vocab).max()} bins "
+          f"({len(lv)} nivåer)")
+
+    diff_mc = make_channels(lv)["bins"] - facit
+    check("make_channels ger samma bin som facit", bool((diff_mc == 0).all()),
+          f"{(diff_mc != 0).mean():.2%} avviker, max {np.abs(diff_mc).max()} bins")
 
 
 # ------------------------------------------------------------------ 5

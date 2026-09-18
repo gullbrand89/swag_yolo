@@ -1,4 +1,7 @@
-"""Cross-entropy med ordinal smoothing på numeriska token och fältviktning."""
+"""
+Cross-entropy med ordinal smoothing på numeriska token och fältviktning,
+plus hjälp-lossen på encodern (aux_loss).
+"""
 import torch
 import torch.nn.functional as F
 
@@ -99,3 +102,47 @@ def num_acc(logits, tgt_out, tol=0):
     same = (RANGE_LO.to(dev)[pred] == RANGE_LO.to(dev)[tgt_out]) & IS_NUM.to(dev)[pred]
     ok = isnum & same & ((pred - tgt_out).abs() <= tol)
     return (ok.sum() / isnum.sum().clamp(min=1)).item()
+
+
+# ------------------------------------------------------------------ hjälp-loss
+AUX_IGNORE = -100          # samma värde som i data.py och all_emitters.py
+_AUX_HEADS = (("new", "aux_new"), ("pos", "aux_pos"), ("merge", "aux_merge"))
+
+
+def aux_loss(aux, src):
+    """
+    Hjälp-loss på encodern: vanlig cross-entropy per puls för vart och ett av huvudena
+    i model.AuxHeads, mot målen som data._pack lagt i src. Positioner med AUX_IGNORE
+    (utfyllnad, första pulsen för `new`, INF-emittrar för `pos`) räknas inte.
+
+    -> (loss, stats)
+       loss  : medel över de huvuden som hade minst ett giltigt mål. Multipliceras
+               med cfg.aux_weight i train.py och läggs till postens loss.
+       stats : dict för loggen
+                 aux_new_acc     träffsäkerhet över alla pulser
+                 aux_new_recall  andel av de VERKLIGA besöksstarterna som hittas.
+                                 Det är den här som säger något: besöksstarter är
+                                 sällsynta, så acc blir hög även om alla missas.
+                 aux_pos_acc     exakt position i uppehållet
+                 aux_merge_acc   träffsäkerhet över alla pulser
+                 aux_merge_recall andel av de ihopslagna intervallen som känns igen
+    """
+    total, n, stats = 0.0, 0, {}
+    for name, key in _AUX_HEADS:
+        tgt = src[key]
+        valid = tgt != AUX_IGNORE
+        if not bool(valid.any()):
+            continue
+        lg, t = aux[name][valid].float(), tgt[valid]
+        l = F.cross_entropy(lg, t)
+        total, n = total + l, n + 1
+        with torch.no_grad():
+            pred = lg.argmax(-1)
+            stats[f"aux_{name}_acc"] = (pred == t).float().mean().item()
+            if name in ("new", "merge"):
+                posi = t > 0
+                if bool(posi.any()):
+                    stats[f"aux_{name}_recall"] = (pred[posi] == t[posi]).float().mean().item()
+    if n == 0:
+        return torch.zeros((), device=src["bins"].device), stats
+    return total / n, stats

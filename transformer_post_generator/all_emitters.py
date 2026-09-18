@@ -200,11 +200,57 @@ def _make_emitter(variant, rng):
 
 
 # ------------------------------------------------------------------ utrullning
-def _make_signal(cycle, lengths, order_fixed, length_fixed, rng, drop_rate, drop_rng=None):
+AUX_IGNORE = -100          # samma värde som ignore_index i loss.aux_loss
+
+
+def _aux_targets(pri_clean, is_inf, keep):
+    """
+    Facit per OBSERVERAT intervall till hjälp-lossen på encodern.
+
+    pri_clean : den rena pulsföljden före brus och bortfall
+    keep      : bool över TOA (n+1 st), eller None utan bortfall. Observerat intervall
+                m spänner de verkliga intervallen a..b = k[m] .. k[m+1]-1.
+
+      new   1 om ett nytt besök börjar någonstans i a..b, annars 0. Första intervallet
+            ignoreras: det finns inget föregående att jämföra med.
+      pos   position i uppehållet för den SISTA verkliga pulsen i spannet, räknat i
+            verkliga pulser från besökets början (0 = första). Ett dubbelt intervall
+            mitt i ett uppehåll får alltså rätt, lagad position. Ignoreras för INF.
+      merge antal verkliga intervall i spannet minus ett, klippt till 0..3.
+            0 = ingen tappad puls, 1 = en tappad, osv.
+
+    Besök definieras av att den RENA nivån byter värde, inte av generatorns
+    besöksindex -- två besök på samma nivå i rad är ett besök i signalen, och det är
+    också så facit kanoniseras.
+    """
+    n = len(pri_clean)
+    byte = np.zeros(n, dtype=np.int64)
+    byte[1:] = pri_clean[1:] != pri_clean[:-1]
+    start = np.maximum.accumulate(np.where(byte == 1, np.arange(n), 0))
+    pos_true = np.arange(n) - start
+
+    k = np.arange(n + 1) if keep is None else np.flatnonzero(keep)
+    a, b = k[:-1], k[1:] - 1
+    c = np.concatenate([[0], np.cumsum(byte)])            # c[j] = antal byten i 0..j-1
+    new = (c[b + 1] - c[a] > 0).astype(np.int64)
+    pos = np.minimum(pos_true[b], cfg.max_dur).astype(np.int64)
+    merge = np.minimum(b - a, 3).astype(np.int64)
+
+    if len(new):
+        new[0] = AUX_IGNORE
+    if is_inf:
+        pos[:] = AUX_IGNORE
+    return dict(new=new, pos=pos, merge=merge)
+
+
+def _make_signal(cycle, lengths, order_fixed, length_fixed, rng, drop_rate, drop_rng=None,
+                 return_aux=False):
     """
     rng      : signalens ström (startfas, slumpad ordning, slumpade längder)
     drop_rng : bortfallets ström. Egen ström, annars förskjuts alla efterföljande
                signaler så fort drop_rate > 0 och evalseten slutar vara jämförbara.
+    return_aux : ge även facit per puls till hjälp-lossen -> (pri, aux). Drar inga
+               slumptal, så signalerna är identiska med och utan.
     """
     drop_rng = rng if drop_rng is None else drop_rng
     n_pulses = GEN.n_pulses
@@ -250,6 +296,8 @@ def _make_signal(cycle, lengths, order_fixed, length_fixed, rng, drop_rate, drop
 
         pri = np.repeat(lv, ln)[:n_pulses].astype(float)
 
+    pri_clean = pri.copy()
+    keep = None
     if GEN.jitter_us > 0:
         pri = pri + rng.uniform(-GEN.jitter_us, GEN.jitter_us, pri.size)
     if drop_rate is None:
@@ -260,13 +308,20 @@ def _make_signal(cycle, lengths, order_fixed, length_fixed, rng, drop_rate, drop
         keep[0] = True
         pri = np.diff(toa[keep])
 
+    if return_aux:
+        return pri, _aux_targets(pri_clean, is_inf, keep)
     return pri
 
 
 # ------------------------------------------------------------------ API
 def create_emitter_data(n_emitters, n_signals, drop_rate=0.0, noise_level=None,
-                        rng=None, only=None):
-    """only : lista med variantnamn, eller None för viktad blandning."""
+                        rng=None, only=None, with_aux=False):
+    """
+    only     : lista med variantnamn, eller None för viktad blandning.
+    with_aux : lägg facit per puls till hjälp-lossen i label["aux"], en dict per
+               signal i samma ordning som pri_sequences. Kontraktet i övrigt är
+               oförändrat, så verktyg som inte känner till nyckeln påverkas inte.
+    """
     rng = rng or np.random.default_rng()
     # Tre strömmar: emittrar, signaler och bortfall oberoende av varandra. Då ger
     # samma seed samma emittrar OCH samma signaler för alla drop_rate, så att
@@ -288,8 +343,11 @@ def create_emitter_data(n_emitters, n_signals, drop_rate=0.0, noise_level=None,
                      order_fixed=bool(order_fixed), length_fixed=bool(length_fixed),
                      variant=variant)
         seqs = [_make_signal(cycle, lengths, order_fixed, length_fixed,
-                             sig_rng, drop_rate, drop_rng)
+                             sig_rng, drop_rate, drop_rng, return_aux=with_aux)
                 for _ in range(n_signals)]
+        if with_aux:
+            label["aux"] = [a for _, a in seqs]
+            seqs = [p for p, _ in seqs]
         out.append((seqs, label))
     return out
 

@@ -53,6 +53,21 @@ class Config:
     # ---------------- input-kanaler
     use_counter: bool = True
     use_drop_flag: bool = False     # från din missing-pulse-detektor
+    # Återbesökskanalen: per puls, hur många BESÖK sedan den här nivån sågs senast.
+    # För en fast cykel med P unika nivåer är den konstant P; för slumpad ordning
+    # varierar den. Det är periodiciteten i besöksrummet, som encodern annars inte
+    # har någon koordinat för -- RoPE ger relativt avstånd i pulser, och "p besök
+    # tillbaka" är ett varierande pulsavstånd eftersom dwelltiderna varierar.
+    # Bakgrund: order_type_ok stod på 0.67 oavsett lossvikt och oavsett bortfall i
+    # träningen, medan tools.check_order visar att signalen bär 0.84. Se data.recur_lag.
+    use_recur: bool = True
+    max_recur: int = 64             # kanalens tak, som max_run
+
+    # ---------------- avkodning
+    # Nivåblocket skrivs strikt stigande; efter ett nivånamn tillåts bara en bin
+    # större än den senaste. Tar bort stamningen (L5 B482 L6 B482). Rent
+    # avkodningsvillkor, ingen omträning. Se model._level_constraint.
+    constrain_levels: bool = True
 
     # ---------------- data
     samples_per_emitter: int = 1    # startfaser per emitter från create_emitter_data
@@ -104,7 +119,12 @@ class Config:
                                     # varje steg och frikopplar stegstorleken från
                                     # lr -- det var orsaken till den stigande lossen.
                                     # Logga grad_norm och sätt ~5 x medianen.
-    struct_weight: float = 0.5      # lossvikt på strukturtokens
+    # Lossvikt per fält, se loss.token_weights och `python -m tools.lossvikt`.
+    # Numeriska token har vikt 1.0 och är referensen. De andra tre sätts efter vad
+    # ett fel KOSTAR: ett typfel nollar exact, ett bin bredvid gör det inte.
+    struct_weight: float = 0.5      # grammatik -- redan lärd, parsed ~ 1.0
+    order_weight: float = 1.0       # nivåordningen inne i ORDER-blocket
+    type_weight: float = 2.0        # FIXED/RANDOM och FIXED/RANGE
     smooth_width: int = 2           # fönstret för utjämningen; >= 3 x sigma
     seed: int = 0
     num_workers: int = 16

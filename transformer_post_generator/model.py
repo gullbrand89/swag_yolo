@@ -33,7 +33,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .config import cfg
-from .vocab import VOCAB, PAD, BOS, EOS
+from .vocab import VOCAB, PAD, BOS, EOS, TOK2ID, LEVEL_NAMES, IS_BIN, BIN_START
+
+_ORDER_ID = TOK2ID["ORDER"]
+_LVL_LO, _LVL_HI = TOK2ID[LEVEL_NAMES[0]], TOK2ID[LEVEL_NAMES[-1]]
 
 
 # ---------------- gemensamt
@@ -57,19 +60,23 @@ class SinusoidalTOA(nn.Module):
         return torch.cat([ang.sin(), ang.cos()], -1)
 
 class InputEmbedding(nn.Module):
-    """bins + cont + (räknare) + (flagga)"""
+    """bins + cont + (räknare) + (flagga) + (återbesökslag)"""
     def __init__(self, d):
         super().__init__()
         self.bin = nn.Embedding(cfg.in_bins, d)
         self.cont = nn.Linear(1, d)
         self.rl = nn.Embedding(cfg.max_run + 1, d) if cfg.use_counter else None
         self.flag = nn.Embedding(2, d) if cfg.use_drop_flag else None
+        # återbesökslag, se data.recur_lag och cfg.use_recur
+        self.recur = nn.Embedding(cfg.max_recur + 1, d) if cfg.use_recur else None
     def forward(self, src):
         x = self.bin(src["bins"]) + self.cont(src["cont"][..., None])
         if self.rl is not None:
             x = x + self.rl(src["rl"].clamp(max=cfg.max_run))
         if self.flag is not None:
             x = x + self.flag(src["flag"])
+        if self.recur is not None:
+            x = x + self.recur(src["recur"].clamp(max=cfg.max_recur))
         return x
 
 class Decoder(nn.Module):
@@ -137,10 +144,18 @@ class Base(nn.Module):
         ys = torch.full((B, 1), BOS, dtype=torch.long, device=dev)
         done = torch.zeros(B, dtype=torch.bool, device=dev)
 
+        # Villkorad avkodning i nivåblocket, se _level_constraint. Tillståndet per rad:
+        # är vi fortfarande före ORDER, och vilken bin skrevs senast.
+        in_levels = torch.ones(B, dtype=torch.bool, device=dev)
+        last_bin = torch.full((B,), BIN_START - 1, dtype=torch.long, device=dev)
+        is_bin = IS_BIN.to(dev)
+
         for _ in range(steps):
             logits = self.decoder(mem, mask, ys)[:, -1].float()
             logits[:, PAD] = -1e30                      # PAD och BOS är aldrig giltiga
             logits[:, BOS] = -1e30                      # utdata mitt i en sekvens
+            if cfg.constrain_levels:
+                logits = self._level_constraint(logits, ys[:, -1], in_levels, last_bin, is_bin)
             if greedy:
                 nxt = logits.argmax(-1)
             else:
@@ -152,9 +167,44 @@ class Base(nn.Module):
             nxt = torch.where(done, torch.full_like(nxt, PAD), nxt)
             ys = torch.cat([ys, nxt[:, None]], 1)
             done |= nxt == EOS
+            # uppdatera avkodningstillståndet
+            wrote_bin = is_bin[nxt]
+            last_bin = torch.where(wrote_bin, nxt, last_bin)
+            in_levels &= nxt != _ORDER_ID
             if done.all():
                 break
         return ys
+
+    @staticmethod
+    def _level_constraint(logits, prev, in_levels, last_bin, is_bin):
+        """
+        Nivåblocket är en MÄNGD, skriven strikt stigande: LEVELS L0 B10 L1 B25 ... ORDER.
+        Efter ett nivånamn får därför bara en bin STÖRRE än den senaste följa. Utan
+        det här villkoret stammar modellen -- L5 B482 L6 B482 L7 B482 -- när den inte
+        kan bestämma sig för att sluta: en upprepning av senaste bin är billigast under
+        ordinalutjämningen, och ingenting säger avkodaren att den är ogiltig.
+
+        I run C (recur, steg 4000) stammade 43 % av posterna och nivåmängden var rätt i
+        51 %, trots att 99,3 % av nivåerna syns i fönstret. Villkoret tar bort
+        upprepningen och låter den bin modellen hade som tvåa -- ofta nästa riktiga
+        nivå -- komma fram.
+
+        Rent avkodningsvillkor: kräver ingen omträning och ändrar ingenting i loss.
+        Slås av med cfg.constrain_levels = False, då är avkodningen som förut.
+        """
+        prev_is_name = (prev >= _LVL_LO) & (prev <= _LVL_HI) & in_levels
+        if not bool(prev_is_name.any()):
+            return logits
+        V = logits.size(-1)
+        ids = torch.arange(V, device=logits.device)
+        # (B, V): tillåtet = är en bin OCH större än radens senaste bin
+        allowed = is_bin[None, :] & (ids[None, :] > last_bin[:, None])
+        # rader vars senaste bin redan är den högsta kan inte fortsätta blocket; då
+        # lämnas logits orörda så att modellen kan avsluta med ORDER som vanligt
+        has_room = allowed.any(-1)
+        apply = prev_is_name & has_room
+        logits = logits.masked_fill(apply[:, None] & ~allowed, -1e30)
+        return logits
 
     @torch.no_grad()
     def greedy(self, src, max_new=None):

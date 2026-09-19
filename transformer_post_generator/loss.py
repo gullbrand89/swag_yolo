@@ -49,45 +49,89 @@ def ordinal_targets(tgt):
     return soft
 
 
-def loss_fn(logits, tgt_out):
-    logp = F.log_softmax(logits, -1)
-    per_tok = -(ordinal_targets(tgt_out) * logp).sum(-1)
-    mask = tgt_out != PAD
-    w = torch.where(IS_NUM.to(tgt_out.device)[tgt_out], 1.0, cfg.struct_weight)
-    return (per_tok * w * mask).sum() / (w * mask).sum()
-
-
 def field_masks(tgt):
     """
-    Delar upp facit-positionerna i tre fält:
+    Delar upp facit-positionerna i FYRA disjunkta fält som täcker allt utom PAD:
       num     : B- och D-token (nivåbins och dwelltider)
-      order   : nivånamn inne i ORDER-blocket + FIXED/RANDOM-valen  (innehåll)
+      type    : FIXED/RANDOM efter ORDER och FIXED/RANGE efter DWELL
+      order   : nivånamnen inne i ORDER-blocket
       grammar : allt annat (LEVELS, ORDER, DWELL, END, INF, nivånamn i definitionerna)
+
+    `type` bröts ut ur de två andra därför att typtokenen är de enda positioner
+    där ETT fel gör hela posten fel. Ett bin som hamnar en bin bredvid kostar lite
+    och syns i level_precision; ett FIXED som skulle ha varit RANDOM nollar exact.
+    De hör inte hemma i samma vikt som allt annat.
+
+    Tokenen FIXED, RANDOM och RANGE förekommer bara som typval, så masken behöver
+    inte villkoras på var i posten de står. Den tidigare versionen villkorade på
+    in_order för att hålla DWELL:s typval utanför `order`; nu ligger båda i `type`
+    i stället, vilket är vad de är.
+
+    OBS för loggen: `order` betyder inte samma sak som i körningar före den här
+    ändringen -- typvalen räknas inte längre in. Kurvorna går inte att lägga
+    ovanpå varandra rakt av.
     """
     valid = tgt != PAD
-    isnum = IS_NUM.to(tgt.device)[tgt] & valid
+    dev = tgt.device
+    isnum = IS_NUM.to(dev)[tgt] & valid
     is_lvl = (tgt >= _LVL0) & (tgt <= _LVL1)
-    is_type = torch.isin(tgt, _TYPE.to(tgt.device))
     # inne i ORDER-blocket: efter ORDER, före DWELL/END (kumulativt per rad)
     after_order = torch.cumsum((tgt == _ORDER).long(), 1) > 0
     before_end = torch.cumsum(((tgt == _DWELL) | (tgt == _END)).long(), 1) == 0
     in_order = after_order & before_end
-    # is_type villkoras på in_order, annars hamnar även DWELL:s FIXED/RANGE här och
-    # `order` blandar ihop nivåordningen med om dwellen är fast eller slumpad.
-    order = valid & in_order & (is_lvl | is_type)
-    grammar = valid & ~isnum & ~order
-    return isnum, order, grammar
+
+    typ = valid & torch.isin(tgt, _TYPE.to(dev))
+    order = valid & in_order & is_lvl & ~typ
+    grammar = valid & ~isnum & ~typ & ~order
+    return isnum, typ, order, grammar
+
+
+FIELDS = ("num", "type", "order", "grammar")
+
+
+def token_weights(tgt):
+    """
+    Lossvikt per position. Noll på PAD, så vikten bär också masken.
+
+    Vikterna speglar vad ett fel KOSTAR, inte hur många token fältet har:
+      num      1.0                 ett bin fel är ett litet fel
+      type     cfg.type_weight     ett typfel nollar exact
+      order    cfg.order_weight    fel ordning nollar exact, men fältet är långt
+      grammar  cfg.struct_weight   den är redan lärd (parsed ~ 1.0)
+
+    Den gamla uppställningen var num 1.0 och allt annat struct_weight. Då fick de
+    två typvalen tillsammans 2,6 % av gradienten medan de numeriska fick 51,5 %,
+    och loss_order stod stilla i 16 000 steg medan loss_num fortsatte falla.
+    Kör `python -m tools.lossvikt` för budgeten de nuvarande värdena ger.
+    """
+    isnum, typ, order, grammar = field_masks(tgt)
+    w = torch.zeros(tgt.shape, dtype=torch.float, device=tgt.device)
+    w[isnum] = 1.0
+    w[typ] = cfg.type_weight
+    w[order] = cfg.order_weight
+    w[grammar] = cfg.struct_weight
+    return w
+
+
+def loss_fn(logits, tgt_out):
+    logp = F.log_softmax(logits, -1)
+    per_tok = -(ordinal_targets(tgt_out) * logp).sum(-1)
+    w = token_weights(tgt_out)
+    return (per_tok * w).sum() / w.sum().clamp(min=1e-6)
 
 
 @torch.no_grad()
 def loss_by_field(logits, tgt_out):
-    """-> (num, order, grammar) medel-loss per fält, för loggning."""
+    """
+    -> dict med medel-loss per fält, för loggning.
+
+    Dict och inte tuple: fälten har blivit fler en gång och lär bli det igen, och
+    en anropare som packar upp positionellt tappar då tyst det sista fältet.
+    """
     logp = F.log_softmax(logits, -1)
     per_tok = -(ordinal_targets(tgt_out) * logp).sum(-1)
-    out = []
-    for m in field_masks(tgt_out):
-        out.append(((per_tok * m).sum() / m.sum().clamp(min=1)).item())
-    return tuple(out)
+    return {namn: ((per_tok * m).sum() / m.sum().clamp(min=1)).item()
+            for namn, m in zip(FIELDS, field_masks(tgt_out))}
 
 
 @torch.no_grad()
@@ -96,7 +140,7 @@ def num_acc(logits, tgt_out, tol=0):
     samma tokenrymd. Det måttet -- inte lossen -- är framstegssignalen: med ett
     utjämnat mål straffas en modell som blir mer bestämd än målfördelningen även
     när argmax är helt rätt."""
-    isnum, _, _ = field_masks(tgt_out)
+    isnum, _, _, _ = field_masks(tgt_out)
     pred = logits.argmax(-1)
     dev = tgt_out.device
     same = (RANGE_LO.to(dev)[pred] == RANGE_LO.to(dev)[tgt_out]) & IS_NUM.to(dev)[pred]

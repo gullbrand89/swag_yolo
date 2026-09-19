@@ -8,8 +8,20 @@ Generator väljs med cfg.emitter, allt annat i config.py. Kör grpo.py efteråt 
 RL-fasen; den startar från checkpointen den här skriver.
 
 Med cfg.aux_weight > 0 optimeras postens loss plus en hjälp-loss på encodern (se
-loss.aux_loss). I loggen är `loss` fortfarande postens loss, jämförbar med äldre
-körningar; `loss_total` är det som faktiskt optimeras.
+loss.aux_loss). I loggen är `loss` postens loss och `loss_total` det som optimeras.
+
+Lossvikterna går att sätta på kommandoraden, så ett A/B inte kräver en filändring:
+
+    python -m transformer_post_generator.train --steps 4000 \
+        --struct-weight 0.5 --order-weight 0.5 --type-weight 0.5   # gamla lossen
+    python -m transformer_post_generator.train --steps 4000        # nya (cfg)
+    python -m transformer_post_generator.train --steps 4000 --p-drop 0   # utan bortfall
+
+Det sista är bisektionen för ordningsfrågan: kan modellen lära sig FIXED/RANDOM
+när periodiciteten inte är förstörd av bortfall? Läs order_type_ok på drop_0.00.
+
+Med alla tre på 0.5 är viktningen exakt den som gällde före fältuppdelningen, så
+de två körningarna skiljer sig i ingenting annat. Vikterna hamnar i config.json.
 """
 import argparse
 import math
@@ -45,7 +57,18 @@ def main():
     ap.add_argument("--steps", type=int, default=cfg.steps)
     ap.add_argument("--lr", type=float, default=cfg.lr)
     ap.add_argument("--batch", type=int, default=cfg.batch)
+    ap.add_argument("--struct-weight", type=float, default=cfg.struct_weight)
+    ap.add_argument("--order-weight", type=float, default=cfg.order_weight)
+    ap.add_argument("--type-weight", type=float, default=cfg.type_weight)
+    ap.add_argument("--p-drop", type=float, default=cfg.p_drop,
+                    help="bortfall vid träning; uniform(0, p_drop) om cfg.randomize_p_drop")
     args = ap.parse_args()
+
+    # Sätts INNAN RunLog skapas, annars loggar config.json värden som inte kördes.
+    cfg.struct_weight = args.struct_weight
+    cfg.order_weight = args.order_weight
+    cfg.type_weight = args.type_weight
+    cfg.p_drop = args.p_drop
 
     torch.manual_seed(cfg.seed); random.seed(cfg.seed); np.random.seed(cfg.seed)
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -80,9 +103,11 @@ def main():
         src = {k: v.to(device) for k, v in src.items()}
         tgt_in, tgt_out = tgt_in.to(device), tgt_out.to(device)
 
-        # loss_post är samma storhet som `loss` i tidigare körningar. Den loggas under
-        # det namnet även nu, så att kurvorna går att lägga på varandra; det som
-        # optimeras är loss_total.
+        # loss_post loggas som `loss`, det som optimeras är loss_total.
+        # OBS: loss_post är INTE jämförbar med körningar före fältviktningen.
+        # loss_fn normaliserar med summan av tokenvikterna, och de vikterna ändrades
+        # (se loss.token_weights). Talet är ett annat även vid identisk modell.
+        # Jämför loss_num/loss_type/loss_order/loss_grammar, eller evalmåtten.
         aux_stats = {}
         if cfg.aux_weight > 0:
             logits, aux = model(src, tgt_in, return_aux=True)
@@ -101,7 +126,7 @@ def main():
         # loss_by_field bygger en till tät (B, T, V)-tensor. Den är bara till för
         # loggen, så den körs inte varje steg.
         if step % cfg.log_every == 0 or step >= args.steps:
-            ln, lo, lg = loss_by_field(logits, tgt_out)
+            fält = loss_by_field(logits, tgt_out)
             # grad_norm är normen FÖRE klippning. Ligger medianen långt över cfg.clip
             # är klippningen aktiv varje steg och sätter stegstorleken i stället för lr.
             with torch.no_grad():
@@ -112,8 +137,9 @@ def main():
             aux_cols = {}
             if cfg.aux_weight > 0:
                 aux_cols = {k: aux_stats.get(k, float("nan")) for k in _AUX_COLS}
-            run.log(step=step, loss=loss_post.item(), loss_num=ln, loss_order=lo,
-                    loss_grammar=lg, grad_norm=float(gn),
+            run.log(step=step, loss=loss_post.item(),
+                    **{f"loss_{k}": v for k, v in fält.items()},
+                    grad_norm=float(gn),
                     logit_max=float(logits.detach().abs().max()), weight_norm=wn,
                     lr=sched.get_last_lr()[0], loss_total=loss.item(), **aux_cols)
             aux_txt = ""
@@ -122,8 +148,9 @@ def main():
                            f"(nytt {aux_cols['aux_new_recall']:.2f} "
                            f"pos {aux_cols['aux_pos_acc']:.2f} "
                            f"tapp {aux_cols['aux_merge_recall']:.2f})")
-            print(f"step {step:6d}  loss {loss_post.item():.4f}  num {ln:.4f}  order {lo:.4f}  "
-                  f"grammar {lg:.4f}{aux_txt}  |g| {float(gn):.2f}  {time.time()-t0:.0f}s")
+            fält_txt = "  ".join(f"{k} {v:.4f}" for k, v in fält.items())
+            print(f"step {step:6d}  loss {loss_post.item():.4f}  {fält_txt}"
+                  f"{aux_txt}  |g| {float(gn):.2f}  {time.time()-t0:.0f}s")
 
         if step % cfg.eval_every == 0 or step >= args.steps:
             run.log_eval(step, evaluate(model, eval_sets, device, collate, run))

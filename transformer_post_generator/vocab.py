@@ -52,7 +52,7 @@ _wmin = math.ceil(3 * max(cfg.sigma_bin, cfg.sigma_dur))
 assert cfg.smooth_width >= _wmin, (
     f"smooth_width={cfg.smooth_width} kapar en fördelning med sigma upp till "
     f"{max(cfg.sigma_bin, cfg.sigma_dur)}. Sätt smooth_width >= {_wmin}.")
-    _w_in = (cfg.in_max - cfg.in_min) / (cfg.in_bins - 2)
+_w_in = (cfg.in_max - cfg.in_min) / (cfg.in_bins - 2)
 _w_out = (cfg.pri_max - cfg.pri_min) / (cfg.n_bins - 1)
 assert cfg.in_min == cfg.pri_min and abs(_w_in - _w_out) < 1e-9, (
     f"input-bin {_w_in:.6f} µs != facit-bin {_w_out:.6f} µs: binsen glider isär "

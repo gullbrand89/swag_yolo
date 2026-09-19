@@ -58,6 +58,56 @@ def run_length(bins, flags=None):
     return rl
 
 
+def recur_lag(bins, rl):
+    """
+    Per puls: hur många BESÖK sedan den här nivån senast besöktes. 0 = aldrig.
+
+    Ett besök börjar där rl == 0. Nivån identifieras med besökets första bin, inom
+    cfg.run_tol_bins -- samma tolerans som räknaren, så de två kanalerna är
+    konsekventa om vad som är "samma nivå".
+
+    Varför den finns
+    ----------------
+    ORDER FIXED betyder att besöksföljden är periodisk. Med P unika nivåer i cykeln
+    får varje puls lag = P, konstant. Med slumpad ordning varierar lagen. Det är
+    alltså FIXED/RANDOM-beslutet utskrivet som en kanal -- en enda skalär på den
+    (andelen pulser på den vanligaste lagen) skiljer klasserna med 0.80 på ren data.
+
+    Utan kanalen måste encodern räkna besök själv och jämföra position i med den
+    puls som ligger p BESÖK tillbaka, vilket är ett varierande PULSavstånd. RoPE
+    ger fasta pulsavstånd. Modellen stod på klassprioren (order_type_ok 0.67) i
+    20 000 steg, med alla lossvikter, och med bortfallet avstängt. Den kunde inte.
+
+    Bortfall
+    --------
+    Ett ihopslaget intervall hamnar på en bin som inte är en nivå, blir ett falskt
+    besök, och rubbar lagen. Kanalen är därför brusig vid bortfall, och det är
+    modellens sak att lära sig när den går att lita på -- den har aux_merge, som
+    hittar två av tre sammanslagningar. Kanalen levererar råvaran, inte svaret.
+
+    Sekventiell, som run_length. Ordboken senast[bin] är liten (antal nivåer).
+    """
+    n = len(bins)
+    lag = np.zeros(n, dtype=np.int64)
+    if n == 0:
+        return lag
+    tol = cfg.run_tol_bins
+    senast = {}                 # besökets bin -> index på det senaste besöket dit
+    besok = 0
+    cur_bin = None
+    cur_lag = 0
+    for i in range(n):
+        if i == 0 or rl[i] == 0:
+            if cur_bin is not None:
+                senast[cur_bin] = besok
+            besok += 1
+            cur_bin = int(bins[i])
+            traffar = [v for b, v in senast.items() if abs(b - cur_bin) <= tol]
+            cur_lag = besok - max(traffar) if traffar else 0
+        lag[i] = cur_lag
+    return lag
+
+
 def make_channels(pri_obs, aux=None):
     """aux : dict med new/pos/merge från generatorn, eller None (-> ignoreras i lossen)."""
     p = np.asarray(pri_obs, dtype=float)
@@ -78,6 +128,13 @@ def make_channels(pri_obs, aux=None):
         flags = np.asarray(detect_missing(p), dtype=bool)
     rl = run_length(bins, flags) if cfg.use_counter else np.zeros(len(bins), dtype=np.int64)
     flag = flags.astype(np.int64) if flags is not None else np.zeros(len(bins), dtype=np.int64)
+    # recur bygger på rl:s besöksgränser. Är räknaren av finns inga gränser att
+    # räkna på, så kanalen är meningslös utan den -- använd rl räknad ändå.
+    if cfg.use_recur:
+        rl_for_recur = rl if cfg.use_counter else run_length(bins, flags)
+        recur = recur_lag(bins, rl_for_recur)
+    else:
+        recur = np.zeros(len(bins), dtype=np.int64)
 
     # Facit till hjälp-lossen. Det är MÅL, inte input: modellen läser aldrig de här
     # nycklarna (InputEmbedding tar bara bins, cont, rl, flag), de följer bara med i
@@ -92,11 +149,11 @@ def make_channels(pri_obs, aux=None):
         ch_aux[k] = a
 
     # pri följer med rå: RL-belöningen mäter mot signalen, inte mot facitet
-    return dict(bins=bins, cont=cont, toa=toa, rl=rl, flag=flag,
+    return dict(bins=bins, cont=cont, toa=toa, rl=rl, flag=flag, recur=recur,
                 pri=p.astype(np.float32), **ch_aux)
 
 
-_CHANNELS = ("bins", "cont", "toa", "rl", "flag")
+_CHANNELS = ("bins", "cont", "toa", "rl", "flag", "recur")
 
 
 def as_signals(seqs):
@@ -176,6 +233,7 @@ def _pack(flat):
         toa=torch.zeros(B, T),
         rl=torch.zeros(B, T, dtype=torch.long),
         flag=torch.zeros(B, T, dtype=torch.long),
+        recur=torch.zeros(B, T, dtype=torch.long),
         mask=torch.ones(B, T, dtype=torch.bool),
     )
     for k in _AUX:                                      # utfyllnad = ignoreras i lossen

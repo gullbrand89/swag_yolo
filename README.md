@@ -4,51 +4,101 @@ En encoder-decoder-transformer som läser en observerad pulsföljd (PRI i µs) o
 skriver en bibliotekspost som beskriver emittern:
 
 ```
-LEVELS N3 L0 N113 L1 N198 L2 N283 ORDER FIXED L0 L2 L1 DWELL FIXED N10 N5 N8 END
+LEVELS L0 B113 L1 B198 L2 B283 ORDER FIXED L0 L2 L1 DWELL FIXED D10 D5 D8 END
 ```
 
-Två träningslägen: cross-entropy mot facit (`train.py`), och RL mot en verifierare
-som mäter posten mot signalen (`grpo.py`).
+Nivåer och dwelltider har **skilda tokenrymder**, `B` respektive `D`. En bin är en
+mätning med ändlig noggrannhet, en dwelltid ett exakt antal pulser — de tål inte
+samma ordinala utjämning.
 
 ```bash
 pip install -r requirements.txt
-python tests.py                                # innan varje längre körning
-python train.py                                # SFT
-python grpo.py --init runs/<tidsstämpel>/model.pt   # RL
+python tests.py                        # innan varje längre körning
+python -m transformer_post_generator.train
 ```
 
 ---
 
-## Filerna
+## Struktur
+
+```
+transformer_post_generator/   biblioteket — allt som träningen behöver
+tools/                        diagnostik och analys, körs som moduler
+docs/LOSS.md                  lossfunktionen rad för rad, med siffror
+tests.py                      testsviten, körs från roten
+train_fixed.py                bisektion: samma modell, FAST data
+_arkiv/                       parkerat, se längst ned
+```
+
+Allt i `tools/` importerar paketet absolut (`from transformer_post_generator.config
+import cfg`), så de körs som moduler från projektroten:
+
+```bash
+python -m tools.run_report
+python -m tools.baseline --n 200
+```
+
+### transformer_post_generator/
 
 | | |
 |---|---|
-| `config.py` | all konfiguration. Ändra här, importera `cfg` överallt. |
-| `vocab.py` | vokabulär och binning |
+| `config.py` | all konfiguration. Ändra här, importera `cfg` överallt |
+| `vocab.py` | vokabulär och binning. `B`-rymd för nivåer, `D`-rymd för dwelltider |
 | `labels.py` | dict ↔ tokens, med kanonisering |
-| `loss.py` | cross-entropy med ordinal smoothing, plus fältvis uppdelning |
-| `model.py` | RoPE- och indexmodellen bakom ett gemensamt gränssnitt |
+| `loss.py` | cross-entropy med ordinal smoothing, fältvis uppdelning, `aux_loss` |
+| `model.py` | RoPE- och indexmodellen bakom ett gemensamt gränssnitt, plus hjälp-huvudena |
 | `data.py` | pipeline: generator → kanaler → batch |
+| `all_emitters.py` | **generatorn.** Nio mönstervarianter, viktade i `GEN.weights` |
 | `train.py` | SFT-loopen |
-| `reward.py` | **verifierbar belöning** — mäter en post mot signalen, utan facit |
-| `grpo.py` | **RL-loopen** (GRPO, DeepSeek-stil) |
 | `runlog.py` | körningsmapp, loggar, fältvisa mått |
 | `verify.py` | mäter facit mot signal; `verify_stats` för en hel batch |
-| `tests.py` | snabb testsvit |
 
-Generatorer, valbara med `cfg.emitter`:
+`__init__.py` löser `cfg.emitter` som ett relativt modulnamn (`".all_emitters"`) mot
+paketet, så en egen generator byts in utan att importvägarna ändras.
+
+### Hjälp-lossen
+
+`model.forward(src, tgt_in, return_aux=True)` ger, utöver logits, tre linjära huvuden
+på encoderns utdata som per puls svarar på *nytt besök?*, *position i uppehållet* och
+*antal ihopslagna intervall*. De vägs in med `cfg.aux_weight` och används **bara i
+träningen** — `generate()` och `greedy()` rör dem inte. Se `loss.aux_loss`.
+
+### tools/
+
+Verifiering av att uppgiften är lösbar, innan modellen får skulden:
 
 | | |
 |---|---|
-| `all_emitters.py` | **standard.** Nio mönstervarianter, viktade i `GEN.weights` |
-| `dwell_emitter.py` | avgränsade experiment på LÄNGDER, en ratt i taget |
-| `stagger_emitter.py` | avgränsade experiment på ORDNING |
+| `label_coverage.py` | hur mycket av facitet syns faktiskt i signalen? |
+| `input_fidelity.py` | överlever nivåerna `make_channels`, eller klipps de bort? |
+| `check_dwell.py` | stämmer DWELL-blocket med vad signalen visar? |
+| `check_order.py` | går FIXED att skilja från RANDOM överhuvudtaget? |
+| `check_visits.py` | räcker observationsfönstret för att se nivåcykeln? |
+| `check_drift.py` | driver dataströmmen över tid? (härmar DataLoaderns processer) |
+| `measure_levels.py` | mät binningsparametrarna ur datan i stället för att härleda dem |
 
-Verktyg: `check_metrics.py` (är måtten konsekventa?), `show_failures.py` (visa facit
-som inte stämmer med sin signal), `diag_rotation.py` (var brister den parvisa
-matchningen?), `inspect_label.py` (plotly-paneler för notebook).
+Utvärdering av en körning:
 
-`LOSS.md` går igenom lossfunktionen rad för rad, med siffror.
+| | |
+|---|---|
+| `run_report.py` | träningskurvan och eval-måtten bredvid varandra |
+| `classify_errors.py` | delar upp felen i preds-filerna efter vad som skiljer |
+| `baseline.py` | samma facit, utan modell — golvet att slå |
+| `num_breakdown.py` | delar upp num-lossen på nivåbins och dwelltider |
+| `sharpness.py` | är modellen för skarp eller för platt mot sitt mål? |
+| `show_failures.py` | facit som inte stämmer med sin signal, i detalj |
+
+Läsbara genomgångar och visualisering:
+
+| | |
+|---|---|
+| `forbehandling.py` | allt som händer med datan innan transformern, steg för steg |
+| `facit.py` | hur facitet byggs och valideras, steg för steg |
+| `forecast.py` | fortsätt en pulsföljd utifrån ett facit (dold semi-Markov) |
+| `inspect_label.py` | plotly-paneler för notebook |
+
+`forbehandling.py` och `facit.py` är skrivna för att **läsas** — explicita loopar, ett
+steg per funktion, även där det går kortare. Den riktiga koden gör samma sak kompaktare.
 
 ---
 
@@ -56,7 +106,7 @@ matchningen?), `inspect_label.py` (plotly-paneler för notebook).
 
 ```python
 # config.py
-emitter: str = "all_emitters"    # "dwell_emitter" | "stagger_emitter" | din egen modul
+emitter: str = ".all_emitters"    # relativt modulnamn, löses mot paketet
 ```
 
 Modulen behöver bara exportera
@@ -79,65 +129,14 @@ Två krav på generatorn, båda kontrollerade av `tests.py`:
 
 ---
 
-## RL: vad och varför
+## Läsa en körning
 
-`train.py` optimerar sannolikheten för nästa token givet att allt före var rätt.
-`LOSS.md` §9 beskriver vad det missar: ett fel i antalet nivåer kostar ett token under
-teacher forcing, men förstör hela posten vid avkodning.
+`runs/<tidsstämpel>/` innehåller `config.json` (hela cfg som körningen såg den),
+`train.csv`, `eval.json` och `preds_drop_*.txt`. Enklast via `python -m tools.run_report`,
+som lägger träningskurvan bredvid eval-måtten och svarar på frågan: när `loss_num`
+steg — blev modellen sämre, eller bara mindre säker?
 
-`grpo.py` optimerar posten i stället. För varje signal samplas `rl_group` svar, varje
-svar får en belöning, och gruppens medel är baslinjen:
-
-```
-A_i = (r_i − medel(r)) / std(r)
-```
-
-Ingen värdemodell — det är hela skillnaden mot PPO, och anledningen att det går att
-köra på en modell i den här storleken.
-
-Belöningen kommer från `reward.py`, som mäter posten mot **signalen**, inte mot
-facitet. Det ger tre saker:
-
-1. Fel som förstör posten straffas som det de är, inte en gång per token.
-2. Modellen tränas på sin egen avkodning — exposure bias försvinner.
-3. Belöningen behöver inget facit, så loopen går att köra på inspelad data.
-
-Delbelöningarna och vikterna står i `reward.RW`. Kör `python reward.py` för en
-egentest som visar att ett sant facit ligger på 1,0 och att degenererade svar
-(en enda nivå, `ORDER RANDOM`, maximalt `DWELL RANGE`) ligger lågt.
-
-### Läsa loggen
-
-`runs_rl/<tidsstämpel>/train.csv`:
-
-| kolumn | vad du tittar efter |
-|---|---|
-| `reward` | ska stiga. Gör den inte det: höj `rl_temp` eller sänk `rl_beta` |
-| `parsed` | ska nå ~1,0 inom några hundra steg |
-| `reward_std` | spridningen **inom** grupperna. Går den mot 0 finns ingen gradient kvar |
-| `uniq` | antal olika svar i batchen. Faller den mot 1 har policyn kollapsat |
-| `kl` | driver iväg = modellen glider från SFT-lösningen. Höj `rl_beta` |
-
-Och i `eval.json`, som är den enda platsen facit används:
-
-> **Stiger `reward` men inte `exact` eller `level_recall` har modellen hittat ett
-> kryphål i verifieraren.** Det är den enda kontroll som räknas. Två kryphål är redan
-> stängda och beskrivna överst i `reward.py`; hittar du ett tredje hör det hemma där.
-
-### Rattarna
-
-| | |
-|---|---|
-| `rl_group` | G. Fler sampel = mindre brus i baslinjen, linjärt dyrare |
-| `rl_beta` | KL mot SFT-modellen. 0 = fri, 0,02 = normalt, högre = konservativt |
-| `rl_temp` | rollout-temperatur. För låg → ingen spridning → ingen gradient |
-| `rl_norm_adv` | `False` ger Dr. GRPO-varianten utan std-normalisering, som annars ger lätta exempel för stort inflytande |
-| `rl_seq_mean` | `False` (default) viktar per token i stället för per sekvens, vilket tar bort längdbiasen |
-| `rl_inner_epochs` | µ. Med 1 är kvoten exakt 1 och klippningen verkningslös |
-
-Hela RL-körningen går i `eval()`-läge. Det stänger av dropout med flit: annars skiljer
-sig log-sannolikheterna mellan rollout och uppdatering, och kvoten mäter brus i stället
-för policyändring.
+`config.json` gör körningarna jämförbara i efterhand. `runs/` ligger i `.gitignore`.
 
 ---
 
@@ -146,9 +145,30 @@ för policyändring.
 * När nivå- och längdcykeln har **olika period** kan formatet inte uttrycka den
   relativa fasen, trots att den är observerbar i signalen. Två emittrar som beter sig
   olika får då samma facit. Åtgärd vore ett offset-token.
-* `cfg.smooth_width = 2` ger `num`-lossen ett golv på **1,372** — se `LOSS.md` §6.
-  Ett `num` på 2,05 är alltså ett överskott på 0,68, inte ett dåligt värde i sig.
-* Samma smoothing-bredd används för nivåbins och dwell-längder trots att skalorna är
-  helt olika. ±2 bins av 512 är försumbart; ±2 pulser av en dwell på 4 är 50 % fel.
-* `reward.py` rekonstruerar ihopslagna intervall upp till `RW.max_merge = 3`. Vid
-  högre bortfall än ~25 % börjar ordnings- och längdbelöningen tappa upplösning.
+* `cfg.smooth_width` sätter ett golv på `num`-lossen — se `docs/LOSS.md` §6. Ett
+  `num` på 2,05 kan alltså vara ett litet överskott, inte ett dåligt värde i sig.
+* Samma smoothing-bredd används för nivåbins och dwelltider trots att skalorna är
+  olika. `vocab.py` ger dem skild `sigma` (`cfg.sigma_bin`, `cfg.sigma_dur`), men
+  bredden är gemensam.
+* `tests.py` säger att steg 6 hoppas över utan torch. Det stämmer inte längre —
+  `data.py` importerar torch på modulnivå, så hela sviten kräver torch.
+
+---
+
+## _arkiv/
+
+Parkerat, inte borttaget. Ingenting i det aktiva kodträdet importerar härifrån.
+
+| | |
+|---|---|
+| `grpo.py`, `reward.py` | RL mot en verifierare — **future work**, se nedan |
+| `dwell_emitter.py`, `stagger_emitter.py` | avgränsade generatorer, en ratt i taget |
+| `diag_rotation.py`, `check_metrics.py` | diagnostik, ersatt av `tools/` |
+| `swag.py`, `xx.py`, `verify_range.py` | engångsskript |
+
+Idén i `grpo.py`/`reward.py`: `train.py` optimerar sannolikheten för nästa token givet
+att allt före var rätt. `docs/LOSS.md` §9 beskriver vad det missar — ett fel i antalet
+nivåer kostar ett token under teacher forcing men förstör hela posten vid avkodning.
+RL-loopen optimerar posten i stället, med en belöning som mäter den mot **signalen**
+och alltså inte behöver något facit. Filerna är inte uppdaterade för den delade
+B/D-tokenrymden och kör inte som de ligger.

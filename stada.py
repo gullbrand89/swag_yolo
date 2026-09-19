@@ -1,132 +1,153 @@
 """
-Flyttar och raderar det som blev kvar efter omstruktureringen.
+Städar bort det som blev kvar i roten efter omstruktureringen.
 
     python stada.py          visar vad som skulle göras, rör ingenting
     python stada.py --kor    gör det
 
-Claude kan skriva filer till din dator men inte radera eller flytta dem, så
-tools/ är redan på plats medan originalen ligger kvar. Det här skriptet tar bort
-dubbletterna och arkiverar det som är parkerat.
+Bakgrunden: koden flyttades från en platt rot in i transformer_post_generator/
+(biblioteket) och tools/ (diagnostiken). Kopiorna i roten blev kvar. De importeras
+inte av någonting -- de är helt enkelt de gamla filerna, med `from config import cfg`
+i stället för `from transformer_post_generator.config import cfg`.
 
-SÄKERHET: ingen fil raderas utan att ersättaren först verifierats finnas på sin
-nya plats. Saknas den hoppas raderingen över och skriptet säger till.
-Ingenting raderas permanent utom __pycache__ -- allt annat flyttas till _arkiv/.
+SÄKERHET
+--------
+Ingen fil raderas på förtroende. För varje dubblett läses både den gamla och den
+nya filen, importraderna stryks, och varje kvarvarande rad i den GAMLA filen måste
+återfinnas i den NYA. Saknas en enda rad hoppas raderingen över och skriptet säger
+vilken rad det gäller -- då har du en ändring i roten som aldrig följde med över.
+
+Tre filer i roten är inte kopior utan tidigare VERSIONER -- de ska skilja sig från
+sina ersättare, så radvis jämförelse ger bara falsklarm på dem. De kontrolleras i
+stället på att den nya funktionen faktiskt finns på plats i ersättaren. Skillnaderna
+står utskrivna vid varje fil, så du ser vad du raderar.
+
+_arkiv/ rörs inte. Körningsmapparna raderas inte utan flyttas till cfg.run_root.
 """
+import re
 import shutil
 import sys
 from pathlib import Path
 
 ROT = Path(__file__).resolve().parent
 PKG = ROT / "transformer_post_generator"
+TOOLS = ROT / "tools"
 KOR = "--kor" in sys.argv
 
-# filer som flyttats till tools/ -- originalet raderas när ersättaren finns
-FLYTTADE = [
-    (ROT / "check_drift.py", ROT / "tools" / "check_drift.py"),
-    (ROT / "run_report.py", ROT / "tools" / "run_report.py"),
-    (ROT / "inspect_label.py", ROT / "tools" / "inspect_label.py"),
-    (PKG / "classify_errors.py", ROT / "tools" / "classify_errors.py"),
-    (PKG / "show_failures.py", ROT / "tools" / "show_failures.py"),
+# (gammal i roten, ersättare) -- ersättaren måste innehålla allt den gamla har
+DUBBLETTER = [
+    (ROT / "check_drift.py",   TOOLS / "check_drift.py"),
+    (ROT / "facit.py",         TOOLS / "facit.py"),
+    (ROT / "fotbehandling.py", TOOLS / "forbehandling.py"),
+    (ROT / "num_breakdowm.py", TOOLS / "num_breakdown.py"),   # stavfel i originalet
+    (ROT / "sharp.py",         TOOLS / "sharpness.py"),
+    (ROT / "labels_steg2.py",  PKG / "labels.py"),
 ]
 
-# hela mappen -- varje fil har en ersättare i tools/ (tests.py finns i roten)
-CLAUDE_OUT = ROT / "Claude outputs"
-CO_ERSATTARE = {
-    "check_dwell.py": ROT / "tools" / "check_dwell.py",
-    "check_visits.py": ROT / "tools" / "check_visits.py",
-    "input_fidelity.py": ROT / "tools" / "input_fidelity.py",
-    "label_coverage.py": ROT / "tools" / "label_coverage.py",
-    "measure_levels.py": ROT / "tools" / "measure_levels.py",
-    "num_breakdown.py": ROT / "tools" / "num_breakdown.py",
-    "sharpness.py": ROT / "tools" / "sharpness.py",
-    "tests.py": ROT / "tests.py",
-}
-
-# parkerat, inte borttaget
-ARKIV = [
-    (ROT / "grpo.py", "RL -- future work"),
-    (ROT / "reward.py", "RL -- future work"),
-    (ROT / "dwell_emitter.py", "alternativ generator, används inte"),
-    (ROT / "stagger_emitter.py", "alternativ generator, används inte"),
-    (ROT / "swag.py", "skiss från log-binningsutredningen, förkastad"),
-    (ROT / "xx.py", "formsond, engångsbruk"),
-    (ROT / "verify_range.py", "engångskontroll"),
-    (ROT / "check_metrics.py", "ersatt av run_report.py"),
-    (PKG / "diag_rotation.py", "diagnostik, används inte"),
+# Tidigare versioner. Ska INTE vara radvis lika -- kontrolleras på att det som
+# tillkommit i ersättaren finns där. (gammal, ny, vad som skiljer, markörer i ny)
+VERSIONER = [
+    (ROT / "label_steg1.py", PKG / "labels.py",
+     "gemensam N-rymd för nivåer och dwelltider; labels.py delar B/D",
+     [r'f"B\{', r'f"D\{']),
+    (ROT / "loss_steg2.py", PKG / "loss.py",
+     "saknar hjälp-lossen på encodern (aux_loss)",
+     [r"\ndef aux_loss\("]),
+    (ROT / "model2.py", PKG / "model.py",
+     "saknar hjälp-huvudena (AuxHeads, forward(..., return_aux)); "
+     "qk_norm är dessutom ett riktigt cfg-fält nu, inte getattr",
+     [r"\nclass AuxHeads\(", r"return_aux", r"self\.qk_norm = cfg\.qk_norm"]),
 ]
 
-DOKUMENT = [(ROT / "LOSS.md", ROT / "docs" / "LOSS.md")]
+# körningsresultat som hamnat i roten i stället för under run_root
+KORNINGAR = ["20260917_152559", "20260917_192801"]
+RUN_ROOT = ROT / "runs"
+
+
+def kropp(p):
+    """Filens rader utan importer, tomrader och indrag -- det som faktiskt är kod."""
+    rader = []
+    for ln in p.read_text(encoding="utf-8").splitlines():
+        s = ln.strip()
+        if s and not s.startswith(("from ", "import ")):
+            rader.append(s)
+    return rader
 
 
 def logg(gjort, text):
     print(f"  {'✓' if gjort else '·'} {text}")
 
 
+def rel(p):
+    try:
+        return p.relative_to(ROT)
+    except ValueError:
+        return p
+
+
 def main():
     print(f"projekt: {ROT}")
     print("TORRKÖRNING -- inget ändras. Kör med --kor för att genomföra.\n"
           if not KOR else "KÖR SKARPT\n")
-
     fel = 0
 
-    print("radera dubbletter (ersättaren måste finnas):")
-    for gammal, ny in FLYTTADE:
+    print("radera dubbletter i roten (ersättaren måste innehålla allt):")
+    for gammal, ny in DUBBLETTER:
         if not gammal.exists():
-            logg(False, f"{gammal.relative_to(ROT)} finns inte redan")
+            logg(False, f"{rel(gammal)} finns inte redan")
             continue
         if not ny.exists():
-            print(f"  ! HOPPAR ÖVER {gammal.relative_to(ROT)} "
-                  f"-- ersättaren {ny.relative_to(ROT)} saknas")
+            print(f"  ! HOPPAR ÖVER {rel(gammal)} -- ersättaren {rel(ny)} saknas")
+            fel += 1
+            continue
+        saknas = [r for r in kropp(gammal) if r not in set(kropp(ny))]
+        if saknas:
+            print(f"  ! HOPPAR ÖVER {rel(gammal)} -- {len(saknas)} rad(er) finns "
+                  f"inte i {rel(ny)}:")
+            for r in saknas[:5]:
+                print(f"      {r[:96]}")
+            print("    granska själv innan du raderar -- något ändrades bara i roten")
             fel += 1
             continue
         if KOR:
             gammal.unlink()
-        logg(True, f"{gammal.relative_to(ROT)}  (finns som {ny.relative_to(ROT)})")
+        logg(True, f"{rel(gammal)}  (ersatt av {rel(ny)})")
 
-    print("\nradera mappen 'Claude outputs':")
-    if CLAUDE_OUT.exists():
-        saknas = [n for n, ny in CO_ERSATTARE.items()
-                  if (CLAUDE_OUT / n).exists() and not ny.exists()]
-        extra = [p.name for p in CLAUDE_OUT.iterdir()
-                 if p.is_file() and p.name not in CO_ERSATTARE]
-        if saknas:
-            print(f"  ! HOPPAR ÖVER -- saknar ersättare för {saknas}")
+    print("\nradera tidigare versioner (ersättaren måste ha det som tillkommit):")
+    for gammal, ny, skillnad, markorer in VERSIONER:
+        if not gammal.exists():
+            logg(False, f"{rel(gammal)} finns inte redan")
+            continue
+        if not ny.exists():
+            print(f"  ! HOPPAR ÖVER {rel(gammal)} -- ersättaren {rel(ny)} saknas")
             fel += 1
-        elif extra:
-            print(f"  ! HOPPAR ÖVER -- oväntade filer som inte har någon "
-                  f"ersättare: {extra}")
-            print("    flytta dem själv först, så vet du att inget tappas")
+            continue
+        text = ny.read_text(encoding="utf-8")
+        saknade = [m for m in markorer if not re.search(m, text)]
+        if saknade:
+            print(f"  ! HOPPAR ÖVER {rel(gammal)} -- hittar inte {saknade} i "
+                  f"{rel(ny)}, så den är kanske inte nyare trots allt")
             fel += 1
-        else:
-            if KOR:
-                shutil.rmtree(CLAUDE_OUT)
-            logg(True, f"'Claude outputs' ({len(CO_ERSATTARE)} filer, alla har ersättare)")
-    else:
-        logg(False, "'Claude outputs' finns inte redan")
-
-    print("\nflytta till _arkiv/:")
-    arkiv = ROT / "_arkiv"
-    if KOR:
-        arkiv.mkdir(exist_ok=True)
-    for p, varfor in ARKIV:
-        if not p.exists():
-            logg(False, f"{p.relative_to(ROT)} finns inte redan")
             continue
         if KOR:
-            shutil.move(str(p), str(arkiv / p.name))
-        logg(True, f"{p.relative_to(ROT)}  -- {varfor}")
+            gammal.unlink()
+        logg(True, f"{rel(gammal)}  -> {rel(ny)}")
+        print(f"      den gamla {skillnad}")
 
-    print("\nflytta till docs/:")
-    docs = ROT / "docs"
-    if KOR:
-        docs.mkdir(exist_ok=True)
-    for src, dst in DOKUMENT:
+    print(f"\nflytta körningar till {rel(RUN_ROOT)}/ (raderas inte):")
+    for namn in KORNINGAR:
+        src = ROT / namn
         if not src.exists():
-            logg(False, f"{src.relative_to(ROT)} finns inte redan")
+            logg(False, f"{namn} finns inte redan")
+            continue
+        dst = RUN_ROOT / namn
+        if dst.exists():
+            print(f"  ! HOPPAR ÖVER {namn} -- {rel(dst)} finns redan")
+            fel += 1
             continue
         if KOR:
+            RUN_ROOT.mkdir(exist_ok=True)
             shutil.move(str(src), str(dst))
-        logg(True, f"{src.relative_to(ROT)} -> {dst.relative_to(ROT)}")
+        logg(True, f"{namn}/ -> {rel(dst)}/")
 
     print("\nrensa __pycache__ (genereras om automatiskt):")
     n = 0
@@ -138,12 +159,19 @@ def main():
         n += 1
     logg(n > 0, f"{n} mappar")
 
+    print("\nlämnas orört med flit:")
+    for text in ("_arkiv/            -- parkerat, bl.a. grpo.py och reward.py (RL)",
+                 "tests.py           -- testsviten, körs från roten",
+                 "train_fixed.py     -- bisektionsverktyget, använder paketimporter",
+                 "emitterbeskrivning.pptx"):
+        print(f"  · {text}")
+
     print()
     if fel:
-        print(f"{fel} steg hoppades över. Läs raderna med ! och åtgärda innan du "
-              f"kör igen.")
+        print(f"{fel} steg hoppades över. Läs raderna med ! och åtgärda innan du kör igen.")
     elif KOR:
         print("klart. Kontrollera med: python tests.py")
+        print("Den här filen har gjort sitt och kan raderas.")
     else:
         print("ser det rätt ut? kör: python stada.py --kor")
 

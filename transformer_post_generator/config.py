@@ -62,6 +62,14 @@ class Config:
     # träningen, medan tools.check_order visar att signalen bär 0.84. Se data.recur_lag.
     use_recur: bool = True
     max_recur: int = 64             # kanalens tak, som max_run
+    # Besökskanalen: besökets löpnummer från fönstrets början. Hör ihop med att posten
+    # ankras vid fönstret (labels.to_tokens, start): ORDER FIXED plats j = nivån på
+    # besök j, och med kanalen är det en uppslagning, inte en räkning. Bakgrund:
+    # tools.cyc_diag på 20260919_171551 -- encodern lärde sig inte cykelpositionen
+    # ens upp till rotation (cyc 0.27 på stagger), så den kanoniska rotationen
+    # (lexikografiskt minsta) var inte inlärbar. Se data.make_channels.
+    use_visit: bool = True
+    max_visit: int = 64             # taket; ORDER behöver bara de första P <= 32 besöken
 
     # ---------------- avkodning
     # Nivåblocket skrivs strikt stigande; efter ett nivånamn tillåts bara en bin
@@ -120,6 +128,15 @@ class Config:
     # huvudena, som är många mål per sekvens -- det här är ett).
     aux_count: bool = True
     aux_count_weight: float = 1.0
+    # Cykelhuvudena: per puls "vilken kanonisk cykelposition" (aux_cyc, klassificering
+    # 0..max_levels) och per sekvens cykelns längd P (samma poolning som count).
+    # Bakgrund: med fast ordning skrev modellen cykeln rätt i 27 % (det_det), och
+    # ALDRIG när en nivå upprepas (0/72, 0/106 för stagger) -- efterföljaren beror på
+    # positionen i cykeln, och den hade encodern ingen representation av.
+    aux_cyc: bool = True
+    aux_period_weight: float = 1.0
+    # avkodning: efter ORDER FIXED spärras DWELL tills P-hatt namn skrivits, tvingas sedan
+    constrain_period: bool = True
 
     # ---------------- träning (SFT, train.py)
     steps: int = 20000

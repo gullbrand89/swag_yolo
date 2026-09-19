@@ -34,15 +34,44 @@ def _min_period(x):
     return x
 
 
+def _rot_k(x):
+    """Förskjutningen k som ger den minsta rotationen: x[k:] + x[:k]."""
+    return min(range(len(x)), key=lambda k: x[k:] + x[:k])
+
+
 def _rot(x):
-    r = min(range(len(x)), key=lambda k: x[k:] + x[:k])
+    r = _rot_k(x)
     return x[r:] + x[:r]
 
 def _L(n):
     return "INF" if n is None else f"D{int(n)}"
 
 
-def to_tokens(levels, lengths, order_fixed, length_fixed, compress_lengths=None):
+def to_tokens(levels, lengths, order_fixed, length_fixed, compress_lengths=None, start=None):
+    """
+    start : generatorns cykelindex för fönstrets FÖRSTA besök (all_emitters ger det
+            per signal i label["start"]), eller None. Med start och fast ordning med
+            minst tre positioner ANKRAS ORDER- och DWELL FIXED-blocken vid fönstrets
+            början i stället för vid den lexikografiskt minsta rotationen. Se _canon.
+    """
+    return _canon(levels, lengths, order_fixed, length_fixed, compress_lengths, start)[0]
+
+
+def canon_info(levels, lengths, order_fixed, length_fixed, compress_lengths=None, start=None):
+    """
+    -> dict(P, k, forced_order, order_fixed) för hjälp-målet aux_cyc.
+
+    P : ORDER-cykelns längd i posten (minsta period av nivåföljden)
+    k : rotationen to_tokens valde: seq_out[j] = seq_min[(j + k) % P]. En puls vars
+        besök ligger på råposition r i generatorns cykel har alltså kanonisk position
+        ((r mod P) - k) mod P -- det är vad encodern ska lära sig per puls.
+    forced_order : ordningen tvingades till FIXED av kanoniseringen (<= 2 nivåer);
+        då finns ingen råposition, och positionen ges av nivåns index i stället.
+    """
+    return _canon(levels, lengths, order_fixed, length_fixed, compress_lengths, start)[1]
+
+
+def _canon(levels, lengths, order_fixed, length_fixed, compress_lengths=None, start=None):
     """
     levels : nivåcykeln i µs (kan innehålla upprepningar)
     lengths: längdcykeln i pulser (None = INF). Behöver INTE ha samma period som levels.
@@ -59,9 +88,25 @@ def to_tokens(levels, lengths, order_fixed, length_fixed, compress_lengths=None)
     Kanonisering:
       * nivåer namnges L0, L1, ... efter bin-värde i stigande ordning
       * varje cykel reduceras till sin minsta period
-      * varje cykel roteras till sin minsta rotation
+      * varje cykel roteras till sin minsta rotation -- UTOM med start given och
+        fast ordning med P >= 3: då roteras den så att position 0 är fönstrets
+        första besök (ankring vid fönstret, se nedan)
       * har cyklerna samma period roteras de TILLSAMMANS, så att kopplingen
         nivå <-> längd bevaras
+
+    Ankring vid fönstret (start):
+      Den lexikografiskt minsta rotationen är en GLOBAL beräkning: för att veta
+      att en puls står på position 0 måste man hitta cykelns lägsta nivå och, vid
+      lika, jämföra framåt. tools.cyc_diag på körning 20260919_171551 visade att
+      encodern inte lär sig det (cyc 0.27 på stagger, och lika lågt upp till
+      rotation -- den har inte ens fasen). Med ankring vid fönstrets första besök
+      är position j helt enkelt "nivån på besök j från start", som avkodaren kan
+      slå upp via besökskanalen (data.make_channels, cfg.use_visit). Posten
+      beskriver då DEN HÄR signalens observerade följd, i linje med att lambda i
+      emittermodellen är signalens tillståndsföljd; konverteraren kanoniserar
+      perioden själv och påverkas inte.
+      P <= 2 ankras inte: med två nivåer är ordningen inte observerbar, och den
+      tvingade ordningen (forced_order) och en äkta tvåcykel måste ge samma post.
       * ett nollbrett intervall skrivs om till en fast dwell: length_fixed=False
         med min == max blir DWELL FIXED
       * med en eller två nivåer är ordningen inte observerbar och skrivs alltid som
@@ -116,17 +161,24 @@ def to_tokens(levels, lengths, order_fixed, length_fixed, compress_lengths=None)
     len_min = _min_period(lengths) if compress_lengths else list(lengths)
 
     # ---- ordning + längder
+    k_rot = 0
+    # ankring vid fönstret: besök j från start ligger på råposition (start + j) i
+    # generatorns cykel, alltså på seq_min[(start + j) % P] -- rotationen är start % P
+    anchored = start is not None and order_fixed and not forced_order and len(seq_min) >= 3
     if order_fixed:
         # forced_order: ordningen är påtvingad av kanoniseringen ovan, inte uppgiven av
         # generatorn. Då finns ingen känd koppling nivå <-> längd att bevara, och att
         # rotera ihop dem skulle hitta på en.
         if length_fixed and not forced_order and len(len_min) == len(seq_min):
             # samma period: rotera ihop så att kopplingen bevaras
-            pairs = _rot(list(zip(seq_min, len_min)))
+            par = list(zip(seq_min, len_min))
+            k_rot = (int(start) % len(par)) if anchored else _rot_k(par)
+            pairs = par[k_rot:] + par[:k_rot]
             seq_out = [p[0] for p in pairs]
             len_out = [p[1] for p in pairs]
         else:
-            seq_out, len_out = _rot(seq_min), None
+            k_rot = (int(start) % len(seq_min)) if anchored else _rot_k(seq_min)
+            seq_out, len_out = seq_min[k_rot:] + seq_min[:k_rot], None
         t += ["ORDER", "FIXED"] + seq_out
     else:
         seq_out, len_out = None, None
@@ -134,7 +186,14 @@ def to_tokens(levels, lengths, order_fixed, length_fixed, compress_lengths=None)
 
     if length_fixed:
         if len_out is None:
-            len_out = _rot(len_min)
+            if anchored:
+                # olika period: dwellcykeln ankras på samma sätt. Generatorn rullar
+                # längderna med samma löpande index som nivåerna (lphase = phase), så
+                # besök j har dwell len_min[(start + j) % len(len_min)].
+                kl = int(start) % len(len_min)
+                len_out = len_min[kl:] + len_min[:kl]
+            else:
+                len_out = _rot(len_min)
         t += ["DWELL", "FIXED"] + [_L(n) for n in len_out]
     else:
         # Den gamla koden filtrerade bort None här och gav "N0 N0" om allt var None.
@@ -150,7 +209,10 @@ def to_tokens(levels, lengths, order_fixed, length_fixed, compress_lengths=None)
     bad = [x for x in t if x not in TOK2ID]
     assert not bad, f"tokens saknas i vokabulär: {bad}"
     assert len(t) + 2 <= cfg.max_tgt, f"facit {len(t)+2} tokens > max_tgt {cfg.max_tgt}"
-    return t
+    info = dict(P=len(seq_min) if order_fixed else None, k=k_rot,
+                forced_order=forced_order, order_fixed=order_fixed, anchored=anchored,
+                bins=list(uniq))       # sorterade nivåbins; index = nivånamnets nummer
+    return t, info
 
 
 def parse(tokens):

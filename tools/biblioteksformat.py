@@ -11,11 +11,15 @@ nivåmängden är känd kan varje puls tilldelas sin nivå, och då är Phi, the
     mu_k          medel av pulserna på nivå k   (inte bin-mitten -- se nedan)
     sigma2_k      varians inom nivån
     phi_k         andel pulser på nivå k
-    lambda        tillståndsföljden, från posten
-    c_tillstand   dwellfördelning per TILLSTÅND   <- den modellen beskriver
-    w_tillstand   vikterna till dem
-    c_stod, w     samma sak per NIVÅ -- reservfallet, se nedan
+    lambda        SIGNALENS tillståndsföljd: nivåindex per besök, observerat
+    c, kant       dwell per besök, och om den är censurerad av fönsterkanten
+    period, cykel härlett ur lambda: minsta period och den kanoniska cykeln
+                  med dwellfördelning per position. None om ingen period.
+    cykel_post    postens ORDER-block som hypotes; cykel_stammer jämför
+    c_stod, w     dwellfördelning per NIVÅ (bakåtkompatibelt)
     Q_niva        övergångar mellan besök -- diagnostik
+    modell        slidens form: N_s tillstånd x K_i komponenter, lambda över tillstånd
+                  (emittermodell); bred_approximation för en klocka över ett tillstånd
 
 mu blir NOGGRANNARE än posten. Ett B-token är kvantiserat till bin-bredden, cirka
 0,25 µs med n_bins=2048 över [0.98, 505]. Medelvärdet över pulserna har ingen sådan
@@ -35,13 +39,20 @@ ingenting i emittern motsvarar; per tillstånd blir det tre skarpa ettor, vilket
 vad emittern faktiskt gör. Därför är c_tillstand huvudresultatet och c_stod bara
 det som återstår när lambda saknas (ORDER RANDOM).
 
-Just därför tas lambda från POSTEN och inte ur Q_niva. En övergångsmatris är
-markovsk: den säger vad som följer på ett VÄRDE. Att 3.0 följs av 125.7 första
-gången och av 187.1 andra gången ryms inte i den och går inte att räkna fram ur
-den. ORDER FIXED L0 L2 L0 L1 säger det rakt ut. Posten är alltså starkare än
-mätningen här, och theta["lambda_matt"] är den svagare mätningen kvar som
-oberoende kontroll -- säger de olika saker beskriver posten och signalen olika
-emittrar.
+Vad lambda ÄR
+-------------
+lambda beskriver signalen, inte emittern: nivåindex per besök, i den ordning de
+observerades. Sliden skriver p(x | {Phi, theta}_x) -- parametrar för DEN HÄR
+signalen -- och det är den läsningen. Två fönster av samma emitter ger två olika
+lambda (fas, längd); det är priset för att vara förlustfri.
+
+Att följden har en period är då ett faktum om lambda, inte en flagga bredvid den.
+period_av läser av den, och cykel är den emitter-invarianta formen: minsta
+periodiska enhet, kanoniskt roterad, med dwellfördelning per position. Den blir
+densamma oavsett fönster. ORDER FIXED/RANDOM i posten är alltså härledbart, och
+postens cykel ligger kvar som cykel_post -- en hypotes att jämföra mot. Under
+bortfall kan den vara bättre än observationen: modellen ser genom hål som
+period_av inte gör (ett enda otilldelat besök ger period None).
 
 Det som INTE går att mäta bort
 ------------------------------
@@ -59,6 +70,22 @@ Kantbesöken är avhuggna av observationsfönstret: det första besöket börjad
 fönstret och det sista slutar efter det. Deras LÄNGDER är alltså censurerade och
 utesluts ur c. Deras pulser räknas däremot med i mu, sigma2 och phi, där de är
 giltiga observationer.
+
+Variant-signaturer (600 emittrar, ren data, givet rätt facit)
+--------------------------------------------------------------
+                 period    cykel==post   skarp dwell    N_s
+  ds_det_det      97 %       79/83          98 %       = cykellängd
+  ds_det_rand    100 %       82/85           6 %       = cykellängd, bred dwell
+  ds_rand_det      7 %         -           100 %       1, K komponenter, skarp dwell var
+  ds_rand_rand     9 %         -             0 %       1, K komponenter, bred dwell
+  jitter           4 %         -           100 %       1, K täta komponenter, dwell 1
+  stagger        100 %       81/83         100 %       = cykellängd
+  static         100 %       89/89         100 %       1, censurerad dwell
+
+Perioden söks i paret (nivå, dwell): två alternerande nivåer med fjorton olika
+dwelltider är period 14 med fjorton skarpa tillstånd, inte period 2 med en
+fjortonspetsig dwell. De få ds_det_det-missarna är fönster med färre än två
+hela varv av parföljden.
 
 Uppmätt (n=2000, seed=7, cfg som den står nu, GIVET RÄTT FACIT)
 ---------------------------------------------------------------
@@ -83,6 +110,25 @@ Cykelåterskapningen faller till 83 % vid 25 % bortfall och räddas INTE av
 grinden -- den har en annan orsak: hål bryter besökskedjan, och en bruten kedja
 ger färre övergångar att räkna, inte sämre pulser. Siffrorna förutsätter dessutom
 rätt facit. Med modellens egen post tillkommer modellens fel ovanpå detta.
+
+c_tillstand tål INTE bortfall
+-----------------------------
+    dwell per tillstånd, exakt      554/554 vid bortfall 0    17/451 vid 0,25
+    dwell per nivå, exakt         4473/4473 vid bortfall 0  3477/4299 vid 0,25
+
+Per tillstånd är det alltså exakt på hel signal och obrukbart vid 25 % bortfall.
+Orsaken är fasen. Positionen härleds ur BESÖKSNUMRET -- besök i hör till
+cykelposition (i + o) mod P -- och det förutsätter att varje besök svarar mot
+exakt en position. Ett hål som delar ett besök i två, eller smälter ihop två,
+förskjuter numreringen, och därefter sitter allt fel. Felen ligger också bara i
+de LÅNGA signalerna, vilket är samma sak sett från andra hållet: ju fler besök,
+desto större chans att fasen glidit någonstans på vägen.
+
+Aggregeringen per nivå har inte det problemet -- den bryr sig inte om ordningen
+-- och faller bara till 81 %. Så länge bortfallet är verkligt är c_stod alltså
+det robusta valet och c_tillstand det exakta. Att göra c_tillstand robust kräver
+att positionen hittas per besök i stället för att räknas fram, alltså en
+inpassning mot cykeln som tillåter hopp. Det är inte gjort.
 """
 import argparse
 import sys
@@ -230,6 +276,95 @@ def _dwell_per_tillstand(besok, cykel):
 
 
 # ------------------------------------------------------------------ konvertering
+def period_av(folj, min_varv=2):
+    """
+    Minsta period P i en OBSERVERAD följd, eller None.
+
+    Skiljer sig från labels._min_period på två sätt som båda kommer av att det
+    här är ett fönster och inte en cykel: längden behöver inte vara en multipel
+    av P (sista varvet får vara påbörjat), och det krävs minst min_varv hela varv
+    innan något kallas periodiskt -- annars är varje följd trivialt periodisk
+    med P = längden. Ett hål (-1) bryter allt: ett fönster med bortfall får
+    ingen period, för vi vet inte vad som stod i hålet.
+    """
+    n = len(folj)
+    def hal(v):                            # -1, eller ett par vars nivå är -1
+        return (v[0] if isinstance(v, tuple) else v) < 0
+    if n == 0 or any(hal(v) for v in folj):
+        return None
+    for P in range(1, n // min_varv + 1):
+        if all(folj[i] == folj[i + P] for i in range(n - P)):
+            return P
+    return None
+
+
+def _rot_min(x):
+    """Minsta rotation, samma kanonisering som labels._rot."""
+    x = list(x)
+    r = min(range(len(x)), key=lambda k: x[k:] + x[:k])
+    return x[r:] + x[:r]
+
+
+def emittermodell(r):
+    """
+    Konverterarens resultat i slidens form.
+
+        N_s tillstånd, tillstånd i har K_i komponenter (mu, sigma2, phi) och en
+        dwellfördelning (w, c) PER KOMPONENT. lambda är en följd över tillstånd.
+
+    Indexen på sliden -- {mu_{1:K_i}}_i och {(w, c)_{1:K_i}}_i -- säger just det:
+    ett tillstånd får vara flertoppigt, och dwellen hör till komponenten. Det ger
+    en enda regel för alla varianter:
+
+      period finns   -> ett tillstånd per cykelposition, K_i = 1, lambda = cykeln
+      ingen period   -> ETT tillstånd med alla nivåer som komponenter, lambda = [0]
+
+    Andra grenen är kollapsen: slumpad ordning betyder att ordningen inte finns,
+    inte att nivåerna inte finns. Komponenterna ligger kvar, skarpa, med var sin
+    dwell -- så ds_rand_det behåller att nivå 3 alltid har dwell 7. Jitter blir
+    samma sak med täta komponenter; en bred klocka över dem är en approximation
+    (bred_approximation) och inte en del av mätningen.
+
+    Statiska emittrar: period 1, ett tillstånd, en komponent, och dwellen är
+    censurerad av fönstret -- c är tom och dwell_min säger hur långt vi såg.
+    """
+    th, Phi = r["theta"], r["Phi"]
+    kant_max = th.get("dwell_kant_max")
+
+    def komp(niv, phi, c, w):
+        d = dict(niva=niv, mu=Phi["mu"][niv], sigma2=Phi["sigma2"][niv], phi=phi,
+                 c=list(c), w=list(w))
+        if not c and kant_max is not None:
+            d["dwell_min"] = kant_max            # bara sett censurerat: minst så lång
+        return d
+
+    if th["period"] is not None:
+        tillstand = [dict(komponenter=[komp(niv, 1.0, c, w)]) for niv, c, w in th["cykel"]]
+    else:
+        komps = [komp(k, Phi["phi"][k], th["c_stod"][k], th["w"][k])
+                 for k in range(Phi["K"]) if Phi["n_pulser"][k] > 0]
+        tillstand = [dict(komponenter=komps)]
+
+    return dict(N_s=len(tillstand), tillstand=tillstand,
+                **{"lambda": th["lambda_tillstand"]}, period=th["period"])
+
+
+def bred_approximation(r, tillstand_i):
+    """
+    (mu, sigma2) för ett tillstånds ALLA komponenter ihopslagna -- en klocka över
+    spannet. Förlustgivande: lägger massa mellan lägena. Till för jitter-liknande
+    tillstånd med många täta komponenter, och bara när den som läser biblioteket
+    vill ha det så. För ett likformigt spann [a, b] blir sigma (b-a)/sqrt(12).
+    """
+    m = r["modell"]["tillstand"][tillstand_i]
+    nivaer = {k["niva"] for k in m["komponenter"]}
+    idx = r["_idx"]; pri = r["_pri"]
+    v = pri[np.isin(idx, list(nivaer))]
+    if len(v) < 2:
+        return None
+    return float(v.mean()), float(v.var(ddof=1))
+
+
 def till_bibliotek(pri, facit, tol_bins=None, trim_kanter=True,
                    uteslut_tvetydiga="auto"):
     """
@@ -330,29 +465,104 @@ def till_bibliotek(pri, facit, tol_bins=None, trim_kanter=True,
     for (_, La), (_, Lb) in zip(inre, inre[1:]):
         Q_langd[pos[La], pos[Lb]] += 1
 
-    # ---- lambda: i vilken ordning tillstånden kommer
-    # Tas från POSTEN, inte ur Q_niva. En övergångsmatris är markovsk -- den kan
-    # bara säga vad som följer på ett VÄRDE. Besöker cykeln samma värde flera gånger
-    # med olika fortsättning (3.0 -> 125.7 en gång, 3.0 -> 187.1 nästa) finns den
-    # följden inte i matrisen, och den går inte att räkna fram ur den heller.
-    # ORDER FIXED L0 L2 L0 L1 säger det rakt ut. Posten är alltså starkare än
-    # mätningen just här, och det är därför den får bestämma.
+    # ---- lambda: signalens tillståndsföljd, som den observerades
+    # lambda beskriver SIGNALEN, inte emittern: nivåindex per besök, i ordning,
+    # -1 där besöket inte gick att tilldela. Det är "det här hände". Att följden
+    # har en period är då ett FAKTUM om lambda som läses av ur den, inte en
+    # flagga bredvid den -- ORDER FIXED/RANDOM i posten är alltså härledbart.
     #
-    # lambda_matt är samma sak räknad ur signalen. Den är svagare -- None så fort
-    # cykeln har upprepningar -- men den är oberoende av posten, och när båda finns
-    # och säger olika saker beskriver posten och signalen olika emittrar.
-    lam = cykel_facit
+    # Två fönster av samma emitter ger två olika lambda (olika fas, olika längd).
+    # Det är priset för att vara förlustfri. Den emitter-invarianta formen är
+    # cykel: minsta periodiska enhet, roterad till kanonisk form, med dwell per
+    # position -- den blir densamma oavsett fönster, när en period finns.
+    lam = [int(v) for v in foljd]
+    c_per_besok = [int(L) for L in langder]
+    kant = [False] * len(foljd)
+    if trim_kanter and len(foljd) > 2:
+        kant[0] = kant[-1] = True          # censurerade dwell, se kommentaren ovan
+    elif trim_kanter and len(foljd) <= 2:
+        kant = [True] * len(foljd)         # ett-två besök: båda kanterna avhuggna
+
+    # Perioden söks i PARET (nivå, dwell), inte i nivåföljden ensam. Två nivåer
+    # som alternerar med fjorton olika dwelltider är en emitter med period 14 och
+    # fjorton skarpa tillstånd -- inte period 2 med en fjortonspetsig dwell. Det
+    # är README:ns "olika perioder" löst: parföljden bär båda cyklerna på en gång.
+    # Kantbesöken har censurerad dwell och ingår inte i parsökningen; de får bara
+    # vara med i nivåföljden. Är paren inte periodiska (slumpad dwell) faller vi
+    # tillbaka på nivåperioden, och dwellen blir en fördelning per position.
+    P_niv = period_av(lam)
+    if P_niv is None and len(lam) == 1 and lam[0] >= 0:
+        P_niv = 1                          # static: ett besök hela fönstret, aldrig lämnat
+    P = None
+    cykel = None
+    if P_niv is not None:
+        inre_i = [i for i, k in enumerate(kant) if not k]
+        par = [(lam[i], c_per_besok[i]) for i in inre_i]
+        P_par = period_av(par)
+        # parperioden måste vara en multipel av nivåperioden; annars är den brus
+        P = P_par if (P_par is not None and P_par % P_niv == 0) else P_niv
+        skarp = P_par is not None and P == P_par
+        # kanonisk rotation av nivåföljden med period P
+        start = inre_i[0] if skarp and inre_i else 0
+        bas = lam[start:start + P]
+        rot = min(range(P), key=lambda k: bas[k:] + bas[:k])
+        niv_cykel = bas[rot:] + bas[:rot]
+        # positionen i cykeln för besök i är (i - start - rot) mod P
+        hink = [[] for _ in range(P)]
+        for i, (v, L, k) in enumerate(zip(lam, c_per_besok, kant)):
+            if not k:
+                hink[(i - start - rot) % P].append(L)
+        cykel = []
+        for pos_i, dl in enumerate(hink):
+            if dl:
+                varden, antal = np.unique(np.array(dl), return_counts=True)
+                cykel.append((niv_cykel[pos_i], [int(x) for x in varden],
+                              [float(x) for x in antal / antal.sum()]))
+            else:
+                cykel.append((niv_cykel[pos_i], [], []))
+
+    # tillståndsföljden över TILLSTÅND (inte nivåer), för emittermodell():
+    # med period är tillstånd = cykelposition; utan period finns bara tillstånd 0
+    if P is not None:
+        lam_tillstand = [((i - start - rot) % P) if v >= 0 else -1
+                         for i, v in enumerate(lam)]
+    else:
+        lam_tillstand = [0 if v >= 0 else -1 for v in lam]
+    kant_langder = [L for L, k, v in zip(c_per_besok, kant, lam) if k and v >= 0]
+    dwell_kant_max = max(kant_langder) if kant_langder else None
+
+    # postens ORDER-block, som hypotes att jämföra mot -- under bortfall kan den
+    # vara bättre än observationen, för modellen ser genom hål som period_av inte gör
+    cykel_post = cykel_facit
+    if cykel is not None and cykel_post is not None:
+        cykel_stammer = _rot_min([c[0] for c in cykel]) == _rot_min(cykel_post)
+    else:
+        cykel_stammer = None
     lam_matt = dominant_cykel(Q_niva)
 
     n_otilldelade = int(len(pri) - n_tilldelade)
-    return {
+    r = {
         "nivaer_facit": nivaer,
         "Phi": {"mu": mu, "sigma2": sigma2, "phi": phi, "K": K, "n_pulser": n_per},
-        "theta": {"c_stod": c_stod, "w": w,
-                  "c_tillstand": c_tillstand, "w_tillstand": w_tillstand,
-                  "c_obs": c,       # rå besökslängd per besök, före sammanräkning
-                  "c_medel": [float(np.mean(x)) if x else None for x in c],
-                  "lambda": lam, "lambda_matt": lam_matt},
+        "theta": {
+            # --- signalens tillståndsföljd (primärt)
+            "lambda": lam,               # nivåindex per besök, -1 = otilldelat
+            "c": c_per_besok,            # dwell per besök, i samma ordning
+            "kant": kant,                # True = censurerad dwell (fönsterkant)
+            # --- härlett: emitterns cykel, om följden är periodisk
+            "period": P,
+            "cykel": cykel,              # [(nivåindex, dwell_stod, dwell_w), ...] kanonisk
+            "cykel_post": cykel_post,    # vad posten påstod (ORDER FIXED), som hypotes
+            "cykel_stammer": cykel_stammer,
+            "lambda_tillstand": lam_tillstand,
+            "dwell_kant_max": dwell_kant_max,
+            # --- bakåtkompatibelt: per nivå och per postens tillståndsposition
+            "c_stod": c_stod, "w": w,
+            "c_tillstand": c_tillstand, "w_tillstand": w_tillstand,
+            "c_obs": c,
+            "c_medel": [float(np.mean(x)) if x else None for x in c],
+            "lambda_post": cykel_facit, "lambda_matt": lam_matt},
+        "_pri": pri, "_idx": idx,        # för bred_approximation
         "Q_niva": Q_niva,
         "Q_langd": Q_langd,
         "langd_varden": langd_varden,
@@ -365,6 +575,8 @@ def till_bibliotek(pri, facit, tol_bins=None, trim_kanter=True,
             "nivaer_utan_pulser": [k for k in range(K) if n_per[k] == 0],
         },
     }
+    r["modell"] = emittermodell(r)
+    return r
 
 
 def pad(Q, D):

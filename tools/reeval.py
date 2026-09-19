@@ -30,7 +30,8 @@ from pathlib import Path
 # de inte när körningen gjordes, och då måste de vara AV för att model.pt ska
 # gå att ladda.
 _FORMFLAGGOR_AV_OM_SAKNAS = {"use_recur": False, "use_drop_flag": False,
-                              "use_counter": True, "aux_count": False}
+                              "use_counter": True, "aux_count": False, "aux_cyc": False,
+                              "use_visit": False}
 
 
 def _lagg_pa_cfg(cfg, run_cfg):
@@ -72,6 +73,10 @@ def main():
                     help="varifrån K kommer: räknehuvudet (model) eller antal bin-kluster "
                          "(cluster; exakt på ren data, överskattar under bortfall). "
                          "Saknar checkpointen huvudet blir det cluster oavsett.")
+    ap.add_argument("--period", dest="period", action="store_true", default=None,
+                    help="slå på periodvillkoret i ORDER FIXED (cfg.constrain_period)")
+    ap.add_argument("--no-period", dest="period", action="store_false",
+                    help="slå av periodvillkoret")
     ap.add_argument("--tag", default=None,
                     help="namn på utfilerna; default 'reeval' eller 'reeval_nc'")
     ap.add_argument("--batch", type=int, default=256)
@@ -88,6 +93,8 @@ def main():
         cfg.constrain_count = a.count
     if a.count_source is not None:
         cfg.count_source = a.count_source
+    if a.period is not None:
+        cfg.constrain_period = a.period
     tag = a.tag or ("reeval_nc" if a.no_constrain
                     else (f"count_{cfg.count_source}" if cfg.constrain_count else "reeval"))
 
@@ -103,7 +110,8 @@ def main():
     print(f"{katalog}: {sum(p.numel() for p in model.parameters())/1e6:.1f}M params, "
           f"{device}, constrain_levels={cfg.constrain_levels}, "
           f"constrain_count={cfg.constrain_count} ({cfg.count_source}), "
-          f"aux_count={cfg.aux_count}, use_recur={cfg.use_recur}")
+          f"constrain_period={cfg.constrain_period}, aux_count={cfg.aux_count}, "
+          f"aux_cyc={cfg.aux_cyc}, use_recur={cfg.use_recur}")
     if hoppade:
         print(f"  (ej cfg-fält, hoppade över: {', '.join(hoppade)})")
 

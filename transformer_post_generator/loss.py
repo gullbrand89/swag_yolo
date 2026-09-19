@@ -150,7 +150,8 @@ def num_acc(logits, tgt_out, tol=0):
 
 # ------------------------------------------------------------------ hjälp-loss
 AUX_IGNORE = -100          # samma värde som i data.py och all_emitters.py
-_AUX_HEADS = (("new", "aux_new"), ("pos", "aux_pos"), ("merge", "aux_merge"))
+_AUX_HEADS = (("new", "aux_new"), ("pos", "aux_pos"), ("merge", "aux_merge"),
+              ("cyc", "aux_cyc"))
 
 
 def aux_loss(aux, src):
@@ -173,6 +174,8 @@ def aux_loss(aux, src):
     """
     total, n, stats = 0.0, 0, {}
     for name, key in _AUX_HEADS:
+        if name not in aux:
+            continue                              # huvudet är avstängt i cfg
         tgt = src[key]
         valid = tgt != AUX_IGNORE
         if not bool(valid.any()):
@@ -190,18 +193,21 @@ def aux_loss(aux, src):
     # Räknehuvudet: ett mål per sekvens. Läggs till som ett eget led med egen vikt,
     # inte som ett fjärde medelvärde -- de tre per-puls-huvudena har hundratals mål
     # per sekvens och skulle annars dränka det.
-    if "count" in aux:
-        t = src["aux_count"]
+    for name, key, vikt in (("count", "aux_count", cfg.aux_count_weight),
+                            ("period", "aux_period", cfg.aux_period_weight)):
+        if name not in aux:
+            continue
+        t = src[key]
         valid = t != AUX_IGNORE
         if bool(valid.any()):
-            lg = aux["count"][valid].float()
+            lg = aux[name][valid].float()
             lc = F.cross_entropy(lg, t[valid])
-            total = total + cfg.aux_count_weight * lc
+            total = total + vikt * lc
             n = max(n, 1)
             with torch.no_grad():
                 pred = lg.argmax(-1)
-                stats["aux_count_acc"] = (pred == t[valid]).float().mean().item()
-                stats["aux_count_mae"] = (pred - t[valid]).abs().float().mean().item()
+                stats[f"aux_{name}_acc"] = (pred == t[valid]).float().mean().item()
+                stats[f"aux_{name}_mae"] = (pred - t[valid]).abs().float().mean().item()
     if n == 0:
         return torch.zeros((), device=src["bins"].device), stats
     return total / n, stats

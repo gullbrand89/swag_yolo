@@ -203,7 +203,7 @@ def _make_emitter(variant, rng):
 AUX_IGNORE = -100          # samma värde som ignore_index i loss.aux_loss
 
 
-def _aux_targets(pri_clean, is_inf, keep):
+def _aux_targets(pri_clean, is_inf, keep, cyc_clean=None):
     """
     Facit per OBSERVERAT intervall till hjälp-lossen på encodern.
 
@@ -218,6 +218,9 @@ def _aux_targets(pri_clean, is_inf, keep):
             mitt i ett uppehåll får alltså rätt, lagad position. Ignoreras för INF.
       merge antal verkliga intervall i spannet minus ett, klippt till 0..3.
             0 = ingen tappad puls, 1 = en tappad, osv.
+      cyc   kanonisk cykelposition för den SISTA verkliga pulsen i spannet -- samma
+            position som ORDER-blocket i posten skriver på plats j. Ges av
+            cyc_clean (per ren puls), AUX_IGNORE där den saknas (slumpad ordning).
 
     Besök definieras av att den RENA nivån byter värde, inte av generatorns
     besöksindex -- två besök på samma nivå i rad är ett besök i signalen, och det är
@@ -240,7 +243,11 @@ def _aux_targets(pri_clean, is_inf, keep):
         new[0] = AUX_IGNORE
     if is_inf:
         pos[:] = AUX_IGNORE
-    return dict(new=new, pos=pos, merge=merge)
+    if cyc_clean is None:
+        cyc = np.full(len(new), AUX_IGNORE, dtype=np.int64)
+    else:
+        cyc = np.asarray(cyc_clean, dtype=np.int64)[b]
+    return dict(new=new, pos=pos, merge=merge, cyc=cyc)
 
 
 def _make_signal(cycle, lengths, order_fixed, length_fixed, rng, drop_rate, drop_rng=None,
@@ -249,15 +256,27 @@ def _make_signal(cycle, lengths, order_fixed, length_fixed, rng, drop_rate, drop
     rng      : signalens ström (startfas, slumpad ordning, slumpade längder)
     drop_rng : bortfallets ström. Egen ström, annars förskjuts alla efterföljande
                signaler så fort drop_rate > 0 och evalseten slutar vara jämförbara.
-    return_aux : ge även facit per puls till hjälp-lossen -> (pri, aux). Drar inga
-               slumptal, så signalerna är identiska med och utan.
+    return_aux : ge även facit per puls till hjälp-lossen. Drar inga slumptal, så
+               signalerna är identiska med och utan.
+
+    -> (pri, start, aux)
+    start : generatorns cykelindex för fönstrets första besök (fasen), None när det
+            inte finns någon cykel (static, slumpad ordning). Går in i posten via
+            label["start"] -> labels.to_tokens(start=...), som ankrar ORDER-blocket
+            vid fönstret. Fönstrets första puls behålls alltid vid bortfall (keep[0]),
+            så ankaret ligger fast oavsett drop_rate.
+    aux   : facit per observerat intervall till hjälp-lossen, eller None.
     """
     drop_rng = rng if drop_rng is None else drop_rng
     n_pulses = GEN.n_pulses
     is_inf = any(x is None for x in lengths)
 
+    cyc_clean = None
+    start = None
     if is_inf:
         pri = np.repeat(cycle[0], n_pulses).astype(float)
+        if return_aux:
+            cyc_clean = np.zeros(n_pulses, dtype=np.int64)     # ett tillstånd, position 0
     else:
         n_visits = int(np.ceil(n_pulses / max(1.0, float(np.mean(lengths))))) + len(cycle) + 4
 
@@ -265,6 +284,7 @@ def _make_signal(cycle, lengths, order_fixed, length_fixed, rng, drop_rate, drop
         if order_fixed:
             reps = int(np.ceil(n_visits / len(cycle))) + 1
             lv = np.tile(cycle, reps)[phase:phase + n_visits]
+            start = phase
         else:
             # Vandringen går över de DISTINKTA nivåerna, inte över cykelns
             # positioner. Cykeln kan innehålla samma värde på flera platser, och
@@ -296,6 +316,26 @@ def _make_signal(cycle, lengths, order_fixed, length_fixed, rng, drop_rate, drop
 
         pri = np.repeat(lv, ln)[:n_pulses].astype(float)
 
+        if return_aux:
+            # Cykelposition per ren puls, samma rotation som posten. Besök i ligger på
+            # råposition (phase + i) mod len(cycle) i generatorns cykel; posten skriver
+            # cykeln med period P och rotation k, så positionen är ((r mod P) - k) mod P.
+            # Med ankring (labels._canon, start=phase) är k = phase mod P och
+            # positionen blir i mod P: besök j från fönstrets start står på plats j.
+            # Tvingad ordning (<= 2 nivåer): positionen är nivåns index.
+            from .labels import canon_info
+            canon = canon_info(cycle.tolist(), list(lengths), order_fixed, length_fixed,
+                               start=start)
+            visit_of = np.repeat(np.arange(len(lv)), ln)[:n_pulses]
+            if canon["order_fixed"] and not canon["forced_order"] and order_fixed:
+                raw = (phase + visit_of) % len(cycle)
+                cyc_clean = ((raw % canon["P"]) - canon["k"]) % canon["P"]
+            elif canon["forced_order"]:
+                bins = [bin_of(v) for v in lv]
+                idx = {b_: i for i, b_ in enumerate(canon["bins"])}
+                cyc_clean = np.repeat([idx[b_] for b_ in bins], ln)[:n_pulses]
+            cyc_clean = None if cyc_clean is None else np.asarray(cyc_clean, dtype=np.int64)
+
     pri_clean = pri.copy()
     keep = None
     if GEN.jitter_us > 0:
@@ -308,9 +348,8 @@ def _make_signal(cycle, lengths, order_fixed, length_fixed, rng, drop_rate, drop
         keep[0] = True
         pri = np.diff(toa[keep])
 
-    if return_aux:
-        return pri, _aux_targets(pri_clean, is_inf, keep)
-    return pri
+    aux = _aux_targets(pri_clean, is_inf, keep, cyc_clean) if return_aux else None
+    return pri, start, aux
 
 
 # ------------------------------------------------------------------ API
@@ -342,12 +381,15 @@ def create_emitter_data(n_emitters, n_signals, drop_rate=0.0, noise_level=None,
         label = dict(levels=cycle.tolist(), lengths=list(lengths),
                      order_fixed=bool(order_fixed), length_fixed=bool(length_fixed),
                      variant=variant)
-        seqs = [_make_signal(cycle, lengths, order_fixed, length_fixed,
+        trip = [_make_signal(cycle, lengths, order_fixed, length_fixed,
                              sig_rng, drop_rate, drop_rng, return_aux=with_aux)
                 for _ in range(n_signals)]
+        seqs = [p for p, _, _ in trip]
+        # start per signal: posten ankras vid fönstret, så facitet är per SIGNAL, inte
+        # per emitter. data.label_to_tokens(label, i) tar signalens index.
+        label["start"] = [st for _, st, _ in trip]
         if with_aux:
-            label["aux"] = [a for _, a in seqs]
-            seqs = [p for p, _ in seqs]
+            label["aux"] = [a for _, _, a in trip]
         out.append((seqs, label))
     return out
 
@@ -370,8 +412,8 @@ def make_variant_eval_sets(n_per_variant=200, n_signals=1, p_drops=(0.0,), seed=
             data = create_emitter_data(n_per_variant, n_signals, p, None, rng, only=[v])
             pairs = []
             for seqs, lab in data:
-                tok = label_to_tokens(lab)
-                pairs.extend((make_channels(s), tok) for s in seqs)
+                pairs.extend((make_channels(s), label_to_tokens(lab, i))
+                             for i, s in enumerate(seqs))
             sets[f"{v}/drop_{p:.2f}"] = pairs
     return sets
 

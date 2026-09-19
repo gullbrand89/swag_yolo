@@ -37,6 +37,8 @@ from .vocab import VOCAB, PAD, BOS, EOS, TOK2ID, LEVEL_NAMES, IS_BIN, BIN_START
 
 _ORDER_ID = TOK2ID["ORDER"]
 _LEVELS_ID = TOK2ID["LEVELS"]
+_FIXED_ID = TOK2ID["FIXED"]
+_DWELL_ID = TOK2ID["DWELL"]
 _LVL_LO, _LVL_HI = TOK2ID[LEVEL_NAMES[0]], TOK2ID[LEVEL_NAMES[-1]]
 
 
@@ -70,6 +72,8 @@ class InputEmbedding(nn.Module):
         self.flag = nn.Embedding(2, d) if cfg.use_drop_flag else None
         # återbesökslag, se data.recur_lag och cfg.use_recur
         self.recur = nn.Embedding(cfg.max_recur + 1, d) if cfg.use_recur else None
+        # besökets löpnummer från fönstrets början, se data.make_channels och cfg.use_visit
+        self.visit = nn.Embedding(cfg.max_visit + 1, d) if cfg.use_visit else None
     def forward(self, src):
         x = self.bin(src["bins"]) + self.cont(src["cont"][..., None])
         if self.rl is not None:
@@ -78,6 +82,8 @@ class InputEmbedding(nn.Module):
             x = x + self.flag(src["flag"])
         if self.recur is not None:
             x = x + self.recur(src["recur"].clamp(max=cfg.max_recur))
+        if self.visit is not None:
+            x = x + self.visit(src["visit"].clamp(max=cfg.max_visit))
         return x
 
 class Decoder(nn.Module):
@@ -110,23 +116,40 @@ class AuxHeads(nn.Module):
     kan inte räkna autoregressivt; encodern får göra det i ett svep, med recur-
     kanalen tillgänglig (max lag ~ antal nivåer vid fast ordning) och hela
     signalen i blickfånget. Poolningen är ett maskat medel över pulserna.
+
+    cyc, period är cykelhuvudena (cfg.aux_cyc). cyc per puls: kanonisk cykel-
+    position 0..max_levels-1, dvs. på vilken plats j i ORDER FIXED-blocket den här
+    pulsens nivå står. period per sekvens: blockets längd P (1..max_levels), samma
+    poolning som count. Bakgrund: cykler med upprepad nivå skrevs ALDRIG rätt
+    (0/72, 0/106) -- efterföljaren beror på var i cykeln man är, och den koordinaten
+    hade encodern inte. Samma mönster som count: ge encodern målet, låt avkodaren
+    läsa av det.
     """
     def __init__(self, d):
         super().__init__()
         self.new = nn.Linear(d, 2)                     # nytt besök: nej / ja
         self.pos = nn.Linear(d, cfg.max_dur + 1)       # position i uppehållet, 0..max_dur
         self.merge = nn.Linear(d, 4)                   # 0, 1, 2, 3+ tappade pulser
-        self.count = nn.Sequential(nn.Linear(d, d), nn.GELU(),
-                                   nn.Linear(d, cfg.max_levels + 1)) if cfg.aux_count else None
+        self.count = self._pooled(d) if cfg.aux_count else None
+        self.cyc = nn.Linear(d, cfg.max_levels + 1) if cfg.aux_cyc else None
+        self.period = self._pooled(d) if cfg.aux_cyc else None
+    @staticmethod
+    def _pooled(d):
+        return nn.Sequential(nn.Linear(d, d), nn.GELU(), nn.Linear(d, cfg.max_levels + 1))
     def forward(self, mem, mask=None):
         out = dict(new=self.new(mem), pos=self.pos(mem), merge=self.merge(mem))
-        if self.count is not None:
+        if self.cyc is not None:
+            out["cyc"] = self.cyc(mem)
+        if self.count is not None or self.period is not None:
             if mask is None:
                 pooled = mem.mean(1)
             else:
                 keep = (~mask).float()[..., None]                    # mask=True är utfyllnad
                 pooled = (mem * keep).sum(1) / keep.sum(1).clamp(min=1.0)
-            out["count"] = self.count(pooled)
+            if self.count is not None:
+                out["count"] = self.count(pooled)
+            if self.period is not None:
+                out["period"] = self.period(pooled)
         return out
 
 
@@ -174,14 +197,16 @@ class Base(nn.Module):
         present = None
         k_hat = None
         kluster = None
+        # huvudena körs en gång på det (upprepade) minnet; count och period läses ur samma svep
+        aux_out = self.aux(mem, mask) if self.aux is not None else {}
         if cfg.constrain_levels and cfg.constrain_present:
             present = self._present_bins(src)
             if cfg.constrain_count:
-                har_huvud = self.aux is not None and getattr(self.aux, "count", None) is not None
+                har_huvud = "count" in aux_out
                 if cfg.count_source == "model" and har_huvud:
                     # räknehuvudet: K ur encodern, i ett svep. Tål bortfall.
                     # mem/mask är redan upprepade n gånger, så k_hat blir (B*n,) direkt.
-                    k_hat = self.aux(mem, mask)["count"].argmax(-1).clamp(min=1)
+                    k_hat = aux_out["count"].argmax(-1).clamp(min=1)
                     # ingen kluster-per-val-koppling: med bortfall finns fler kluster än
                     # nivåer, och vilka K av dem som är riktiga är modellens sak att välja
                     kluster = None
@@ -196,13 +221,25 @@ class Base(nn.Module):
                 present = present.repeat_interleave(n, 0)
         n_names = torch.zeros(B, dtype=torch.long, device=dev)
 
+        # Periodvillkoret i ORDER FIXED-blocket, se _period_constraint. Tillstånd per
+        # rad: är vi inne i blocket (mellan "ORDER FIXED" och DWELL), och hur många
+        # namn har skrivits där. p_hat är periodhuvudets P.
+        p_hat = None
+        if cfg.constrain_period and "period" in aux_out:
+            p_hat = aux_out["period"].argmax(-1).clamp(min=1)
+        in_ofix = torch.zeros(B, dtype=torch.bool, device=dev)
+        n_order = torch.zeros(B, dtype=torch.long, device=dev)
+
         for _ in range(steps):
+            prev = ys[:, -1]
             logits = self.decoder(mem, mask, ys)[:, -1].float()
             logits[:, PAD] = -1e30                      # PAD och BOS är aldrig giltiga
             logits[:, BOS] = -1e30                      # utdata mitt i en sekvens
             if cfg.constrain_levels:
-                logits = self._level_constraint(logits, ys[:, -1], in_levels, last_bin,
+                logits = self._level_constraint(logits, prev, in_levels, last_bin,
                                                 is_bin, present, k_hat, n_names, kluster)
+            if p_hat is not None:
+                logits = self._period_constraint(logits, prev, in_ofix, n_order, p_hat)
             if greedy:
                 nxt = logits.argmax(-1)
             else:
@@ -217,12 +254,44 @@ class Base(nn.Module):
             # uppdatera avkodningstillståndet
             wrote_bin = is_bin[nxt]
             last_bin = torch.where(wrote_bin, nxt, last_bin)
-            wrote_name = (nxt >= _LVL_LO) & (nxt <= _LVL_HI) & in_levels
-            n_names = n_names + wrote_name.long()
+            is_name = (nxt >= _LVL_LO) & (nxt <= _LVL_HI)
+            n_names = n_names + (is_name & in_levels).long()
             in_levels &= nxt != _ORDER_ID
+            # ORDER FIXED öppnar blocket, DWELL stänger det; namnen däremellan räknas
+            in_ofix |= (prev == _ORDER_ID) & (nxt == _FIXED_ID)
+            n_order = n_order + (is_name & in_ofix).long()
+            in_ofix &= nxt != _DWELL_ID
             if done.all():
                 break
         return ys
+
+    @staticmethod
+    def _period_constraint(logits, prev, in_ofix, n_order, p_hat):
+        """
+        ORDER FIXED-blocket är cykeln, skriven en gång: ORDER FIXED L2 L0 L2 L1 DWELL.
+        Dess längd är perioden P, och den avgör var DWELL får komma. Utan villkoret
+        avgör avkodaren själv när cykeln är slut, och för cykler med upprepad nivå
+        gick det aldrig: den slutade efter de unika nivåerna, eller fortsatte ett
+        varv för mycket.
+
+        Med p_hat från periodhuvudet (cfg.aux_cyc) styrs stoppet: efter "FIXED" eller
+        ett namn inne i blocket spärras DWELL så länge färre än p_hat namn skrivits,
+        och när p_hat är nått spärras namnen så att DWELL följer. Vilka namn som
+        skrivs lämnas åt modellen -- det här är count-villkoret, fast för ORDER.
+
+        Rent avkodningsvillkor; slås av med cfg.constrain_period = False.
+        """
+        V = logits.size(-1)
+        ids = torch.arange(V, device=logits.device)
+        prev_ok = in_ofix & ((prev == _FIXED_ID) | ((prev >= _LVL_LO) & (prev <= _LVL_HI)))
+        if not bool(prev_ok.any()):
+            return logits
+        is_name = (ids >= _LVL_LO) & (ids <= _LVL_HI)
+        forts = prev_ok & (n_order < p_hat)
+        stanna = prev_ok & (n_order >= p_hat)
+        logits = logits.masked_fill(forts[:, None] & (ids[None, :] == _DWELL_ID), -1e30)
+        logits = logits.masked_fill(stanna[:, None] & is_name[None, :], -1e30)
+        return logits
 
     @staticmethod
     def _present_bins(src):

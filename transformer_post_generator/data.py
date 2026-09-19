@@ -36,12 +36,21 @@ create_emitter_data = _emitter.create_emitter_data
 detect_missing = getattr(_emitter, "detect_missing", None)
 
 AUX_IGNORE = -100          # ignore_index i loss.aux_loss; även utfyllnad i _pack
-_AUX = ("aux_new", "aux_pos", "aux_merge")
+_AUX = ("aux_new", "aux_pos", "aux_merge", "aux_cyc")
 _AUX_OK = "with_aux" in inspect.signature(create_emitter_data).parameters
 
 
-def label_to_tokens(label):
-    return to_tokens(label["levels"], label["lengths"], label["order_fixed"], label["length_fixed"])
+def label_to_tokens(label, i=0):
+    """
+    Posten för signal i under etiketten. Facitet är per SIGNAL sedan ORDER-blocket
+    ankras vid fönstret (labels.to_tokens, start): label["start"][i] är fönstrets
+    första cykelposition. Saknas nyckeln (äldre generator) blir posten den
+    kanoniska, som förut.
+    """
+    start = label.get("start")
+    st = None if start is None else start[i]
+    return to_tokens(label["levels"], label["lengths"], label["order_fixed"],
+                     label["length_fixed"], start=st)
 
 
 # ---------------- input-kanaler
@@ -121,10 +130,25 @@ def n_levels_of(tokens):
     return n
 
 
-def make_channels(pri_obs, aux=None, n_levels=None):
+def n_order_of(tokens):
+    """Cykelns längd P i posten = antal nivånamn i ORDER FIXED-blocket. None vid
+    RANDOM. Målet för periodhuvudet, av samma skäl som n_levels_of är räknemålet."""
+    i = tokens.index("ORDER") + 1
+    if tokens[i] != "FIXED":
+        return None
+    n = 0
+    for t in tokens[i + 1:]:
+        if t == "DWELL":
+            break
+        n += 1
+    return n
+
+
+def make_channels(pri_obs, aux=None, n_levels=None, period=None):
     """
     aux      : dict med new/pos/merge från generatorn, eller None (-> ignoreras i lossen).
     n_levels : antal nivåer i facitet, mål för räknehuvudet. None -> ignoreras.
+    period   : ORDER-cykelns längd, mål för periodhuvudet. None -> ignoreras.
     """
     p = np.asarray(pri_obs, dtype=float)
     if p.ndim != 1:
@@ -151,6 +175,15 @@ def make_channels(pri_obs, aux=None, n_levels=None):
         recur = recur_lag(bins, rl_for_recur)
     else:
         recur = np.zeros(len(bins), dtype=np.int64)
+    # Besökskanalen: löpnummer på besöket räknat från fönstrets början, 0, 1, 2, ...
+    # (tak cfg.max_visit). Posten ankras vid fönstret, så ORDER FIXED plats j är
+    # nivån på besök j -- med den här kanalen är det en uppslagning för avkodarens
+    # cross-attention i stället för en räkning. Byggd på rl:s besöksgränser som recur.
+    if cfg.use_visit:
+        rl_v = rl if cfg.use_counter else run_length(bins, flags)
+        visit = np.minimum(np.cumsum(rl_v == 0) - 1, cfg.max_visit).astype(np.int64)
+    else:
+        visit = np.zeros(len(bins), dtype=np.int64)
 
     # Facit till hjälp-lossen. Det är MÅL, inte input: modellen läser aldrig de här
     # nycklarna (InputEmbedding tar bara bins, cont, rl, flag), de följer bara med i
@@ -166,13 +199,14 @@ def make_channels(pri_obs, aux=None, n_levels=None):
 
     # Räknehuvudets mål: ett tal per SEKVENS, inte per puls. Samma AUX_IGNORE.
     ch_aux["aux_count"] = np.int64(AUX_IGNORE if n_levels is None else n_levels)
+    ch_aux["aux_period"] = np.int64(AUX_IGNORE if period is None else period)
 
     # pri följer med rå: RL-belöningen mäter mot signalen, inte mot facitet
-    return dict(bins=bins, cont=cont, toa=toa, rl=rl, flag=flag, recur=recur,
+    return dict(bins=bins, cont=cont, toa=toa, rl=rl, flag=flag, recur=recur, visit=visit,
                 pri=p.astype(np.float32), **ch_aux)
 
 
-_CHANNELS = ("bins", "cont", "toa", "rl", "flag", "recur")
+_CHANNELS = ("bins", "cont", "toa", "rl", "flag", "recur", "visit")
 
 
 def as_signals(seqs):
@@ -195,12 +229,13 @@ def make_pairs(rng, n_emitters=1, p_drop=None, samples=None, **kw):
                                cfg.noise_level, rng, **kw)
     out = []
     for seqs, label in data:
-        tokens = label_to_tokens(label)
         sigs = as_signals(seqs)
         auxs = label.get("aux") or [None] * len(sigs)
-        k = n_levels_of(tokens) if cfg.aux_count else None
-        for s, a in zip(sigs, auxs):        # en signal i taget, aldrig hela arrayen
-            out.append((make_channels(s, a, k), tokens))
+        for i, (s, a) in enumerate(zip(sigs, auxs)):   # en signal i taget, aldrig hela arrayen
+            tokens = label_to_tokens(label, i)          # per signal: ankrad vid fönstret
+            k = n_levels_of(tokens) if cfg.aux_count else None
+            P = n_order_of(tokens) if cfg.aux_cyc else None
+            out.append((make_channels(s, a, k, P), tokens))
     return out
 
 class StreamDataset(Dataset):
@@ -254,12 +289,15 @@ def _pack(flat):
         rl=torch.zeros(B, T, dtype=torch.long),
         flag=torch.zeros(B, T, dtype=torch.long),
         recur=torch.zeros(B, T, dtype=torch.long),
+        visit=torch.zeros(B, T, dtype=torch.long),
         mask=torch.ones(B, T, dtype=torch.bool),
     )
     for k in _AUX:                                      # utfyllnad = ignoreras i lossen
         src[k] = torch.full((B, T), AUX_IGNORE, dtype=torch.long)
     src["aux_count"] = torch.tensor([int(ch["aux_count"]) for ch, _ in flat],
                                     dtype=torch.long)
+    src["aux_period"] = torch.tensor([int(ch["aux_period"]) for ch, _ in flat],
+                                     dtype=torch.long)
     tgt = torch.full((B, L), PAD, dtype=torch.long)
     for i, (ch, _) in enumerate(flat):
         n = len(ch["bins"])

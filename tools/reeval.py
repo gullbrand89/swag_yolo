@@ -30,7 +30,7 @@ from pathlib import Path
 # de inte när körningen gjordes, och då måste de vara AV för att model.pt ska
 # gå att ladda.
 _FORMFLAGGOR_AV_OM_SAKNAS = {"use_recur": False, "use_drop_flag": False,
-                              "use_counter": True}
+                              "use_counter": True, "aux_count": False}
 
 
 def _lagg_pa_cfg(cfg, run_cfg):
@@ -64,6 +64,14 @@ def main():
     ap.add_argument("run", help="körningsmapp med config.json och model.pt")
     ap.add_argument("--no-constrain", action="store_true",
                     help="stäng av villkorad avkodning (cfg.constrain_levels = False)")
+    ap.add_argument("--count", dest="count", action="store_true", default=None,
+                    help="slå på räknevillkoret (cfg.constrain_count)")
+    ap.add_argument("--no-count", dest="count", action="store_false",
+                    help="slå av räknevillkoret")
+    ap.add_argument("--count-source", choices=("model", "cluster"), default=None,
+                    help="varifrån K kommer: räknehuvudet (model) eller antal bin-kluster "
+                         "(cluster; exakt på ren data, överskattar under bortfall). "
+                         "Saknar checkpointen huvudet blir det cluster oavsett.")
     ap.add_argument("--tag", default=None,
                     help="namn på utfilerna; default 'reeval' eller 'reeval_nc'")
     ap.add_argument("--batch", type=int, default=256)
@@ -76,7 +84,12 @@ def main():
     from transformer_post_generator.config import cfg
     satta, hoppade = _lagg_pa_cfg(cfg, run_cfg)
     cfg.constrain_levels = not a.no_constrain
-    tag = a.tag or ("reeval_nc" if a.no_constrain else "reeval")
+    if a.count is not None:
+        cfg.constrain_count = a.count
+    if a.count_source is not None:
+        cfg.count_source = a.count_source
+    tag = a.tag or ("reeval_nc" if a.no_constrain
+                    else (f"count_{cfg.count_source}" if cfg.constrain_count else "reeval"))
 
     import torch
     from transformer_post_generator.data import collate, make_eval_sets
@@ -88,7 +101,9 @@ def main():
     state = torch.load(katalog / "model.pt", map_location=device)
     model.load_state_dict(state)
     print(f"{katalog}: {sum(p.numel() for p in model.parameters())/1e6:.1f}M params, "
-          f"{device}, constrain_levels={cfg.constrain_levels}, use_recur={cfg.use_recur}")
+          f"{device}, constrain_levels={cfg.constrain_levels}, "
+          f"constrain_count={cfg.constrain_count} ({cfg.count_source}), "
+          f"aux_count={cfg.aux_count}, use_recur={cfg.use_recur}")
     if hoppade:
         print(f"  (ej cfg-fält, hoppade över: {', '.join(hoppade)})")
 

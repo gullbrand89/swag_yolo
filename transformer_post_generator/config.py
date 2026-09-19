@@ -68,6 +68,18 @@ class Config:
     # större än den senaste. Tar bort stamningen (L5 B482 L6 B482). Rent
     # avkodningsvillkor, ingen omträning. Se model._level_constraint.
     constrain_levels: bool = True
+    # ...och dessutom bara bins som FÖREKOMMER i insignalen (+-run_tol_bins).
+    # En nivå är en PRI som sänds, så en bin utan pulser kan inte vara en nivå.
+    # Se model._present_bins. Kräver constrain_levels.
+    constrain_present: bool = True
+    # ...och ANTALET nivåer sätts till antalet bin-kluster i insignalen: ORDER
+    # spärras tills så många nivåer skrivits, och tvingas sedan. Exakt på ren
+    # data, överskattar under bortfall. Ett tak att mäta mot -- se
+    # model._count_present. Kräver constrain_present.
+    constrain_count: bool = True
+    # varifrån antalet kommer: "model" = räknehuvudet (cfg.aux_count), "cluster" =
+    # antal bin-kluster i insignalen. Saknar checkpointen huvudet används cluster.
+    count_source: str = "model"
 
     # ---------------- data
     samples_per_emitter: int = 1    # startfaser per emitter från create_emitter_data
@@ -103,6 +115,11 @@ class Config:
     # 0 stänger av allt: inga huvuden byggs, inga mål genereras, och en checkpoint
     # från en körning utan hjälp-loss går att ladda som vanligt.
     aux_weight: float = 0.3
+    # Räknehuvudet: antal nivåer per sekvens, klassificering över 1..max_levels.
+    # Se model.AuxHeads. Lossen vägs med aux_count_weight (separat från de per-puls-
+    # huvudena, som är många mål per sekvens -- det här är ett).
+    aux_count: bool = True
+    aux_count_weight: float = 1.0
 
     # ---------------- träning (SFT, train.py)
     steps: int = 20000

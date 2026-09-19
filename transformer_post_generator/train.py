@@ -42,7 +42,7 @@ from .runlog import RunLog, evaluate
 
 
 _AUX_COLS = ("loss_aux", "aux_new_acc", "aux_new_recall", "aux_pos_acc",
-             "aux_merge_acc", "aux_merge_recall")
+             "aux_merge_acc", "aux_merge_recall", "aux_count_acc", "aux_count_mae")
 
 
 def sanity_checks(n=500):
@@ -147,7 +147,8 @@ def main():
                 aux_txt = (f"  aux {aux_cols['loss_aux']:.3f} "
                            f"(nytt {aux_cols['aux_new_recall']:.2f} "
                            f"pos {aux_cols['aux_pos_acc']:.2f} "
-                           f"tapp {aux_cols['aux_merge_recall']:.2f})")
+                           f"tapp {aux_cols['aux_merge_recall']:.2f} "
+                           f"K {aux_cols['aux_count_acc']:.2f})")
             fält_txt = "  ".join(f"{k} {v:.4f}" for k, v in fält.items())
             print(f"step {step:6d}  loss {loss_post.item():.4f}  {fält_txt}"
                   f"{aux_txt}  |g| {float(gn):.2f}  {time.time()-t0:.0f}s")

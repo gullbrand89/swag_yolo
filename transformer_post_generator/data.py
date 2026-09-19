@@ -108,8 +108,24 @@ def recur_lag(bins, rl):
     return lag
 
 
-def make_channels(pri_obs, aux=None):
-    """aux : dict med new/pos/merge från generatorn, eller None (-> ignoreras i lossen)."""
+def n_levels_of(tokens):
+    """Antal nivåer i en post = antal nivånamn i LEVELS-blocket. Det är exakt det
+    antal avkodaren ska skriva, så det är målet för räknehuvudet -- inte
+    len(set(levels)), som skulle kunna skilja sig om två nivåer delade bin."""
+    n = 0
+    for t in tokens[1:]:
+        if t == "ORDER":
+            break
+        if t[0] == "L" and t[1:].isdigit():
+            n += 1
+    return n
+
+
+def make_channels(pri_obs, aux=None, n_levels=None):
+    """
+    aux      : dict med new/pos/merge från generatorn, eller None (-> ignoreras i lossen).
+    n_levels : antal nivåer i facitet, mål för räknehuvudet. None -> ignoreras.
+    """
     p = np.asarray(pri_obs, dtype=float)
     if p.ndim != 1:
         raise ValueError(
@@ -148,6 +164,9 @@ def make_channels(pri_obs, aux=None):
         assert len(a) == len(p), f"{k}: {len(a)} mål för {len(p)} pulser"
         ch_aux[k] = a
 
+    # Räknehuvudets mål: ett tal per SEKVENS, inte per puls. Samma AUX_IGNORE.
+    ch_aux["aux_count"] = np.int64(AUX_IGNORE if n_levels is None else n_levels)
+
     # pri följer med rå: RL-belöningen mäter mot signalen, inte mot facitet
     return dict(bins=bins, cont=cont, toa=toa, rl=rl, flag=flag, recur=recur,
                 pri=p.astype(np.float32), **ch_aux)
@@ -179,8 +198,9 @@ def make_pairs(rng, n_emitters=1, p_drop=None, samples=None, **kw):
         tokens = label_to_tokens(label)
         sigs = as_signals(seqs)
         auxs = label.get("aux") or [None] * len(sigs)
+        k = n_levels_of(tokens) if cfg.aux_count else None
         for s, a in zip(sigs, auxs):        # en signal i taget, aldrig hela arrayen
-            out.append((make_channels(s, a), tokens))
+            out.append((make_channels(s, a, k), tokens))
     return out
 
 class StreamDataset(Dataset):
@@ -238,6 +258,8 @@ def _pack(flat):
     )
     for k in _AUX:                                      # utfyllnad = ignoreras i lossen
         src[k] = torch.full((B, T), AUX_IGNORE, dtype=torch.long)
+    src["aux_count"] = torch.tensor([int(ch["aux_count"]) for ch, _ in flat],
+                                    dtype=torch.long)
     tgt = torch.full((B, L), PAD, dtype=torch.long)
     for i, (ch, _) in enumerate(flat):
         n = len(ch["bins"])

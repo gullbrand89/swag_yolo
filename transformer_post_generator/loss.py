@@ -187,6 +187,21 @@ def aux_loss(aux, src):
                 posi = t > 0
                 if bool(posi.any()):
                     stats[f"aux_{name}_recall"] = (pred[posi] == t[posi]).float().mean().item()
+    # Räknehuvudet: ett mål per sekvens. Läggs till som ett eget led med egen vikt,
+    # inte som ett fjärde medelvärde -- de tre per-puls-huvudena har hundratals mål
+    # per sekvens och skulle annars dränka det.
+    if "count" in aux:
+        t = src["aux_count"]
+        valid = t != AUX_IGNORE
+        if bool(valid.any()):
+            lg = aux["count"][valid].float()
+            lc = F.cross_entropy(lg, t[valid])
+            total = total + cfg.aux_count_weight * lc
+            n = max(n, 1)
+            with torch.no_grad():
+                pred = lg.argmax(-1)
+                stats["aux_count_acc"] = (pred == t[valid]).float().mean().item()
+                stats["aux_count_mae"] = (pred - t[valid]).abs().float().mean().item()
     if n == 0:
         return torch.zeros((), device=src["bins"].device), stats
     return total / n, stats

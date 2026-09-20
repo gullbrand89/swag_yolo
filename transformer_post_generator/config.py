@@ -113,6 +113,11 @@ class Config:
     max_tgt: int = 256
     max_src: int = 4096             # bara index-modellen
     time_frac: float = 0.5          # bara rope-modellen
+    # Segmentposition i avkodaren: antal token sedan senaste strukturtoken, som
+    # embedding på avkodarens input. Ger avkodaren sitt "j" i ORDER-blocket utan att
+    # räkna. Se model._seg_pos.
+    use_seg_pos: bool = True
+    max_seg: int = 64               # LEVELS-blocket är längst: 2 x max_levels token
     qk_norm: bool = True            # QK-normalisering i encoderns attention (model.py)
 
     # ---------------- hjälp-loss på encodern (se loss.aux_loss)
@@ -135,6 +140,8 @@ class Config:
     # positionen i cykeln, och den hade encodern ingen representation av.
     aux_cyc: bool = True
     aux_period_weight: float = 1.0
+    # periodhuvudet per puls (röstning) i stället för på poolat medel, se model.AuxHeads
+    period_per_pulse: bool = True
     # avkodning: efter ORDER FIXED spärras DWELL tills P-hatt namn skrivits, tvingas sedan
     constrain_period: bool = True
 

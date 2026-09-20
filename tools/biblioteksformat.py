@@ -298,6 +298,15 @@ def period_av(folj, min_varv=2):
     return None
 
 
+def _min_period_lista(x):
+    """minsta P så att x[i] == x[i % P] för alla i, med P | len(x)"""
+    n = len(x)
+    for P in range(1, n + 1):
+        if n % P == 0 and all(x[i] == x[i % P] for i in range(n)):
+            return P
+    return n
+
+
 def _rot_min(x):
     """Minsta rotation, samma kanonisering som labels._rot."""
     x = list(x)
@@ -316,14 +325,22 @@ def emittermodell(r):
     ett tillstånd får vara flertoppigt, och dwellen hör till komponenten. Det ger
     en enda regel för alla varianter:
 
-      period finns   -> ett tillstånd per cykelposition, K_i = 1, lambda = cykeln
-      ingen period   -> ETT tillstånd med alla nivåer som komponenter, lambda = [0]
+      period i nivåföljden  -> ett tillstånd per cykelposition, K_i = 1, lambda = cykeln
+      period bara i dwellen -> ett tillstånd per DWELLposition, alla nivåer som
+                               komponenter i varje, samma nivåmodell i alla
+                               (ds_rand_det: ordningen slumpad, dwellcykeln fast)
+      ingen period          -> ETT tillstånd med alla nivåer som komponenter, lambda = [0]
 
-    Andra grenen är kollapsen: slumpad ordning betyder att ordningen inte finns,
+    Tredje grenen är kollapsen: slumpad ordning betyder att ordningen inte finns,
     inte att nivåerna inte finns. Komponenterna ligger kvar, skarpa, med var sin
-    dwell -- så ds_rand_det behåller att nivå 3 alltid har dwell 7. Jitter blir
-    samma sak med täta komponenter; en bred klocka över dem är en approximation
-    (bred_approximation) och inte en del av mätningen.
+    dwellfördelning. Jitter blir samma sak med täta komponenter; en bred klocka
+    över dem är en approximation (bred_approximation) och inte en del av mätningen.
+
+    I dwellgrenen delas nivåmodellen mellan tillstånden: nivån dras oberoende av
+    var i dwellcykeln besöket är, så mu, sigma2 och phi skattas en gång på alla
+    pulser och är per konstruktion samma i varje tillstånd. Dwellen per tillstånd
+    är dwellcykelns värde på den positionen.
+    grund säger vilken gren som gav tillstånden: "niva" | "dwell" | "ingen".
 
     Statiska emittrar: period 1, ett tillstånd, en komponent, och dwellen är
     censurerad av fönstret -- c är tom och dwell_min säger hur långt vi såg.
@@ -340,13 +357,20 @@ def emittermodell(r):
 
     if th["period"] is not None:
         tillstand = [dict(komponenter=[komp(niv, 1.0, c, w)]) for niv, c, w in th["cykel"]]
+        grund, period = "niva", th["period"]
+    elif th.get("period_dwell") is not None:
+        tillstand = [dict(komponenter=[komp(k, Phi["phi"][k], [d], [1.0])
+                                       for k in range(Phi["K"]) if Phi["n_pulser"][k] > 0])
+                     for d in th["dwell_cykel"]]
+        grund, period = "dwell", th["period_dwell"]
     else:
         komps = [komp(k, Phi["phi"][k], th["c_stod"][k], th["w"][k])
                  for k in range(Phi["K"]) if Phi["n_pulser"][k] > 0]
         tillstand = [dict(komponenter=komps)]
+        grund, period = "ingen", None
 
     return dict(N_s=len(tillstand), tillstand=tillstand,
-                **{"lambda": th["lambda_tillstand"]}, period=th["period"])
+                **{"lambda": th["lambda_tillstand"]}, period=period, grund=grund)
 
 
 def bred_approximation(r, tillstand_i):
@@ -521,10 +545,32 @@ def till_bibliotek(pri, facit, tol_bins=None, trim_kanter=True,
             else:
                 cykel.append((niv_cykel[pos_i], [], []))
 
+    # ---- tredje sökningen: period i DWELLFÖLJDEN ensam
+    # Slumpad ordning betyder inte att emittern saknar tillstånd. ds_rand_det rullar
+    # en fast dwellcykel (7, 11, 3, 7, 11, 3 ...) över besöken oberoende av vilken
+    # nivå som kommer: tillståndet är platsen i dwellcykeln, och nivån är en
+    # slumpad komponent i det. Aggregerat per nivå blandas cykeln bort (nivå 3 får
+    # {7, 11, 3}); per dwellposition är den skarp. Söks bara när nivåföljden
+    # saknar period -- har den en, bär paren redan dwellen.
+    P_dw, dw_cykel, dw_start, dw_rot = None, None, 0, 0
+    if P is None and lam and all(v >= 0 for v in lam):
+        inre_i = [i for i, k in enumerate(kant) if not k]
+        dwf = [c_per_besok[i] for i in inre_i]
+        P_dw = period_av(dwf)
+        if P_dw is not None:
+            dw_start = inre_i[0]
+            bas = dwf[:P_dw]
+            dw_rot = min(range(P_dw), key=lambda k: bas[k:] + bas[:k])
+            dw_cykel = bas[dw_rot:] + bas[:dw_rot]
+
     # tillståndsföljden över TILLSTÅND (inte nivåer), för emittermodell():
-    # med period är tillstånd = cykelposition; utan period finns bara tillstånd 0
+    # med period är tillstånd = cykelposition; med bara dwellperiod är det
+    # dwellpositionen; utan period finns inga positioner
     if P is not None:
         lam_tillstand = [((i - start - rot) % P) if v >= 0 else -1
+                         for i, v in enumerate(lam)]
+    elif P_dw is not None:
+        lam_tillstand = [((i - dw_start - dw_rot) % P_dw) if v >= 0 else -1
                          for i, v in enumerate(lam)]
     else:
         lam_tillstand = [0 if v >= 0 else -1 for v in lam]
@@ -552,6 +598,8 @@ def till_bibliotek(pri, facit, tol_bins=None, trim_kanter=True,
             # --- härlett: emitterns cykel, om följden är periodisk
             "period": P,
             "cykel": cykel,              # [(nivåindex, dwell_stod, dwell_w), ...] kanonisk
+            "period_dwell": P_dw,        # period i dwellföljden ensam (bara utan nivåperiod)
+            "dwell_cykel": dw_cykel,     # [dwell per dwellposition], kanonisk rotation
             "cykel_post": cykel_post,    # vad posten påstod (ORDER FIXED), som hypotes
             "cykel_stammer": cykel_stammer,
             "lambda_tillstand": lam_tillstand,
@@ -620,6 +668,7 @@ def sjalvtest(n=200, drop=0.0, seed=0, tol_bins=None, grind=None):
     flerlage = 0
     ts_ratt = ts_provad = 0
     ordning_ratt = ordning_provad = 0
+    dwp_ratt = dwp_provad = 0; dwp_fel = []
     trasiga = []
 
     for seqs, lab in data:
@@ -665,6 +714,25 @@ def sjalvtest(n=200, drop=0.0, seed=0, tol_bins=None, grind=None):
                 if fick == [int(sant)]:
                     ts_ratt += 1
 
+        # slumpad ordning med fast dwellcykel: ett tillstånd per dwellposition,
+        # och samma nivåmodell i alla tillstånd
+        # Kräver att fönstret rymmer minst två hela dwellcykler (period_av:s krav)
+        # och minst tre nivåer -- med två alternerar följden och HAR en nivåperiod.
+        if (not lab["order_fixed"] and lab["length_fixed"]
+                and None not in lab["lengths"]
+                and len(set(lab["levels"])) >= 3
+                and len(r["theta"]["c"]) - 2 >= 2 * _min_period_lista([int(x) for x in lab["lengths"]])):
+            dwp_provad += 1
+            m = r["modell"]
+            sant_P = _min_period_lista([int(x) for x in lab["lengths"]])
+            samma = all(sorted(kk["niva"] for kk in t["komponenter"]) ==
+                        sorted(kk["niva"] for kk in m["tillstand"][0]["komponenter"])
+                        for t in m["tillstand"])
+            if m["N_s"] == sant_P and samma:
+                dwp_ratt += 1
+            elif len(dwp_fel) < 3:
+                dwp_fel.append((lab["variant"], lab["lengths"], m["N_s"], m["grund"]))
+
         # phi mot den sanna tidsandelen, när den är entydig
         if lab["order_fixed"] and lab["length_fixed"]:
             cyk = [sanna.index(round(float(v), 9)) for v in lab["levels"]]
@@ -705,6 +773,10 @@ def sjalvtest(n=200, drop=0.0, seed=0, tol_bins=None, grind=None):
     print(f"         {ts_ratt}/{ts_provad} TILLSTÅND med exakt rätt dwell")
     print(f"         {flerlage} nivåer fick flera stödpunkter")
     print(f"ordning: {ordning_ratt}/{ordning_provad} cykler återskapade ur Q_niva")
+    print(f"dwellcykel vid slumpad ordning: {dwp_ratt}/{dwp_provad} med rätt antal tillstånd "
+          f"och samma nivåmodell i alla")
+    for v, ln, ns, g in dwp_fel:
+        print(f"  ! {v}: lengths {ln} -> N_s {ns} ({g})")
     print(f"otilldelade pulser: medel {np.mean(andel_ot):.4f}  "
           f"max {np.max(andel_ot):.4f}")
     for v, sant, fick in trasiga[:3]:
@@ -714,7 +786,7 @@ def sjalvtest(n=200, drop=0.0, seed=0, tol_bins=None, grind=None):
     # i konverteraren. Med bortfall är den ett mätvärde: information saknas i
     # signalen, och då säger en nolla ingenting om koden.
     if drop == 0:
-        return not trasiga
+        return not trasiga and dwp_ratt == dwp_provad
     print("\n(bortfall > 0: avvikelser är informationsförlust i signalen, inte fel i konverteraren)")
     return True
 

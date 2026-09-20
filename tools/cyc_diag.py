@@ -115,7 +115,8 @@ def main():
                     out = model.greedy(src, max_new=cfg.eval_max_new).cpu()
                 tgt_cyc = src["aux_cyc"].cpu(); tgt_P = src["aux_period"].cpu()
                 pred_cyc = aux["cyc"].argmax(-1).cpu() if "cyc" in aux else None
-                pred_P = aux["period"].argmax(-1).cpu() if "period" in aux else None
+                pred_P = (model.aux.period_logits(aux, src["mask"]).argmax(-1).cpu()
+                          if "period" in aux else None)
                 for i in range(out.size(0)):
                     tt = ids_to_tokens(tgt_out[i]); pt = ids_to_tokens(out[i])
                     P_true = int(tgt_P[i])

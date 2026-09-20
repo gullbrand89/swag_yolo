@@ -198,9 +198,15 @@ def aux_loss(aux, src):
         if name not in aux:
             continue
         t = src[key]
-        valid = t != AUX_IGNORE
+        lg_all = aux[name]
+        if lg_all.dim() == 3:
+            # per-puls-huvud (period_per_pulse): sekvensens mål gäller varje giltig puls
+            t = t[:, None].expand(-1, lg_all.size(1))
+            valid = (t != AUX_IGNORE) & ~src["mask"]
+        else:
+            valid = t != AUX_IGNORE
         if bool(valid.any()):
-            lg = aux[name][valid].float()
+            lg = lg_all[valid].float()
             lc = F.cross_entropy(lg, t[valid])
             total = total + vikt * lc
             n = max(n, 1)

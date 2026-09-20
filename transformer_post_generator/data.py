@@ -197,6 +197,13 @@ def make_channels(pri_obs, aux=None, n_levels=None, period=None):
         assert len(a) == len(p), f"{k}: {len(a)} mål för {len(p)} pulser"
         ch_aux[k] = a
 
+    # Cyc-målet bara där besökskanalen bär information. Bortom taket är målet
+    # (besök mod P) en räkning encodern inte kan göra -- cyc_diag på 20260920_073307:
+    # 0.139 på stagger, där 94 % av pulserna ligger över taket -- och att träna på det
+    # ger bara brus in i encodern. ORDER behöver ändå bara de första P <= 32 besöken.
+    if cfg.use_visit and aux is not None:
+        ch_aux["aux_cyc"] = np.where(visit >= cfg.max_visit, AUX_IGNORE, ch_aux["aux_cyc"])
+
     # Räknehuvudets mål: ett tal per SEKVENS, inte per puls. Samma AUX_IGNORE.
     ch_aux["aux_count"] = np.int64(AUX_IGNORE if n_levels is None else n_levels)
     ch_aux["aux_period"] = np.int64(AUX_IGNORE if period is None else period)

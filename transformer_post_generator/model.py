@@ -39,6 +39,30 @@ _ORDER_ID = TOK2ID["ORDER"]
 _LEVELS_ID = TOK2ID["LEVELS"]
 _FIXED_ID = TOK2ID["FIXED"]
 _DWELL_ID = TOK2ID["DWELL"]
+# strukturtoken som börjar ett nytt segment i posten, se _seg_pos
+_SEG_START = torch.tensor([BOS] + [TOK2ID[t] for t in
+                          ("LEVELS", "ORDER", "FIXED", "RANDOM", "RANGE", "DWELL", "END")])
+
+
+def _seg_pos(tgt_in):
+    """
+    (B, T) long: antal token sedan senaste strukturtoken, 0 på strukturtoken själv.
+    ORDER FIXED L2 L0 L2 DWELL -> FIXED 0, L2 1, L0 2, L2 3, DWELL 0.
+
+    Det är avkodarens "j". När den ska skriva namn j i ORDER-blocket är inputen
+    token nummer j efter FIXED, så frågan "nivån på besök j" blir en direkt
+    matchning mot besökskanalen i encodern (data.make_channels, cfg.use_visit).
+    Utan den har avkodaren bara absolut position i hela strängen, och ORDER-blocket
+    börjar på en plats som beror på hur många nivåer LEVELS-blocket hade -- j måste
+    då räknas fram, och räkning är just det som inte fungerat. Bakgrund:
+    tools.cyc_diag på 20260920_073307: ds_det_rand hade P rätt i 92.5 % och alla
+    första P besök etiketterade, men ORDER rätt i 43.5 %.
+    """
+    T = tgt_in.size(1)
+    idx = torch.arange(T, device=tgt_in.device)[None, :].expand_as(tgt_in)
+    start = torch.isin(tgt_in, _SEG_START.to(tgt_in.device))
+    last = torch.cummax(torch.where(start, idx, torch.full_like(idx, -1)), 1).values
+    return (idx - last).clamp(min=0, max=cfg.max_seg)
 _LVL_LO, _LVL_HI = TOK2ID[LEVEL_NAMES[0]], TOK2ID[LEVEL_NAMES[-1]]
 
 
@@ -91,6 +115,7 @@ class Decoder(nn.Module):
         super().__init__()
         self.emb = nn.Embedding(len(VOCAB), d, padding_idx=PAD)
         self.pos = SinusoidalIndex(d, cfg.max_tgt)
+        self.seg = nn.Embedding(cfg.max_seg + 1, d) if cfg.use_seg_pos else None   # se _seg_pos
         layer = nn.TransformerDecoderLayer(d, cfg.nhead, cfg.ff, cfg.dropout,
                                            batch_first=True, norm_first=True)
         self.dec = nn.TransformerDecoder(layer, cfg.dec_layers, norm=nn.LayerNorm(d))
@@ -99,6 +124,8 @@ class Decoder(nn.Module):
         T = tgt_in.size(1)
         causal = torch.triu(torch.ones(T, T, dtype=torch.bool, device=tgt_in.device), 1)
         y = self.emb(tgt_in) + self.pos(T)
+        if self.seg is not None:
+            y = y + self.seg(_seg_pos(tgt_in))
         h = self.dec(y, mem, tgt_mask=causal, tgt_key_padding_mask=(tgt_in == PAD),
                      memory_key_padding_mask=mask)
         return self.out(h)
@@ -132,7 +159,19 @@ class AuxHeads(nn.Module):
         self.merge = nn.Linear(d, 4)                   # 0, 1, 2, 3+ tappade pulser
         self.count = self._pooled(d) if cfg.aux_count else None
         self.cyc = nn.Linear(d, cfg.max_levels + 1) if cfg.aux_cyc else None
-        self.period = self._pooled(d) if cfg.aux_cyc else None
+        # Periodhuvudet per PULS (cfg.period_per_pulse) i stället för på ett poolat
+        # medel. Ett medel över pulserna kan inte svara på "efter hur många besök
+        # upprepas mönstret" -- aux_period_acc stod på 0.60-0.62 i tre körningar
+        # oavsett allt annat. Per puls kan varje puls via attention hitta var dess
+        # eget mönster återkommer (recur-kanalen ger redan lagget för unika nivåer),
+        # målet är detsamma för alla pulser i sekvensen, och vid avkodning röstar
+        # pulserna: medel av logits över giltiga pulser, se period_logits.
+        if not cfg.aux_cyc:
+            self.period = None
+        elif cfg.period_per_pulse:
+            self.period = nn.Linear(d, cfg.max_levels + 1)
+        else:
+            self.period = self._pooled(d)
     @staticmethod
     def _pooled(d):
         return nn.Sequential(nn.Linear(d, d), nn.GELU(), nn.Linear(d, cfg.max_levels + 1))
@@ -140,7 +179,9 @@ class AuxHeads(nn.Module):
         out = dict(new=self.new(mem), pos=self.pos(mem), merge=self.merge(mem))
         if self.cyc is not None:
             out["cyc"] = self.cyc(mem)
-        if self.count is not None or self.period is not None:
+        if self.period is not None and cfg.period_per_pulse:
+            out["period"] = self.period(mem)                         # (B, T, C)
+        if self.count is not None or (self.period is not None and not cfg.period_per_pulse):
             if mask is None:
                 pooled = mem.mean(1)
             else:
@@ -148,9 +189,21 @@ class AuxHeads(nn.Module):
                 pooled = (mem * keep).sum(1) / keep.sum(1).clamp(min=1.0)
             if self.count is not None:
                 out["count"] = self.count(pooled)
-            if self.period is not None:
-                out["period"] = self.period(pooled)
+            if self.period is not None and not cfg.period_per_pulse:
+                out["period"] = self.period(pooled)                  # (B, C)
         return out
+
+    @staticmethod
+    def period_logits(out, mask=None):
+        """(B, C) periodlogits per sekvens: per-puls-huvudets logits medelvärdesbildade
+        över giltiga pulser (rösten), eller det poolade huvudets logits som de är."""
+        lg = out["period"]
+        if lg.dim() == 2:
+            return lg
+        if mask is None:
+            return lg.mean(1)
+        keep = (~mask).float()[..., None]
+        return (lg * keep).sum(1) / keep.sum(1).clamp(min=1.0)
 
 
 def _aux_heads(d):
@@ -226,7 +279,7 @@ class Base(nn.Module):
         # namn har skrivits där. p_hat är periodhuvudets P.
         p_hat = None
         if cfg.constrain_period and "period" in aux_out:
-            p_hat = aux_out["period"].argmax(-1).clamp(min=1)
+            p_hat = AuxHeads.period_logits(aux_out, mask).argmax(-1).clamp(min=1)
         in_ofix = torch.zeros(B, dtype=torch.bool, device=dev)
         n_order = torch.zeros(B, dtype=torch.long, device=dev)
 

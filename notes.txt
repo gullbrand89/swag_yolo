@@ -45,3 +45,12 @@ So the targets are the clean truth, the inputs are the observed signal, and the 
 The two counting heads are never trivial. No input channel says how many levels there are or how long the cycle is; both are global over 512 pulses.
 
 Short version for the room: on clean data two of them would be trivial; we train with dropout, and there the inputs are wrong and the targets are the truth — that's the gap the heads close.
+
+
+
+############################### Results - Exact match
+
+Speaker notes
+Run 20260920_141955, first and only training on this format (20k steps). Sub-metrics on clean data, fixed-order types: state count 0.67–0.70, component correct given the count 0.49–0.59, dwell correct 0.50–0.70. Two-level emitters count as fixed order (an alternating sequence is indistinguishable from a fixed two-cycle), which is why "random order" rows aren't 0 on order. For the same model, with the signal available, the emitter model is identical in 87 % / 75 % — the gap is what the record has to carry on its own now. Previous format for comparison: token-exact 54 % / 34 %, but the converter did the ordering.
+
+If you want the strengths/weaknesses to read at a glance, colour the clean column: green above 70, red below 40.

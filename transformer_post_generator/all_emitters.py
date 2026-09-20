@@ -259,13 +259,20 @@ def _make_signal(cycle, lengths, order_fixed, length_fixed, rng, drop_rate, drop
     return_aux : ge även facit per puls till hjälp-lossen. Drar inga slumptal, så
                signalerna är identiska med och utan.
 
-    -> (pri, start, aux)
+    -> (pri, start, aux, fas)
     start : generatorns cykelindex för fönstrets första besök (fasen), None när det
             inte finns någon cykel (static, slumpad ordning). Går in i posten via
             label["start"] -> labels.to_tokens(start=...), som ankrar ORDER-blocket
             vid fönstret. Fönstrets första puls behålls alltid vid bortfall (keep[0]),
             så ankaret ligger fast oavsett drop_rate.
     aux   : facit per observerat intervall till hjälp-lossen, eller None.
+    fas   : läget vid fönstrets SLUT, till formatet per tillstånd
+            (labels_tillstand): i_last = besöksindex (från fönstrets start) för den
+            sista observerade pulsen, phase/lphase = nivå- resp. längdcykelns fas
+            vid besök 0, last_level = nivån (µs) på sista besöket, seen = hur många
+            rena pulser det besöket hunnit visa fram till sista behållna pulsen.
+            Räknas efter bortfallet: tappas fönstrets sista pulser slutar
+            observationen tidigare, och det är det observerade slutet som ankrar.
     """
     drop_rng = rng if drop_rng is None else drop_rng
     n_pulses = GEN.n_pulses
@@ -281,6 +288,7 @@ def _make_signal(cycle, lengths, order_fixed, length_fixed, rng, drop_rate, drop
         n_visits = int(np.ceil(n_pulses / max(1.0, float(np.mean(lengths))))) + len(cycle) + 4
 
         phase = int(rng.integers(0, len(cycle)))
+        lphase = phase
         if order_fixed:
             reps = int(np.ceil(n_visits / len(cycle))) + 1
             lv = np.tile(cycle, reps)[phase:phase + n_visits]
@@ -348,8 +356,37 @@ def _make_signal(cycle, lengths, order_fixed, length_fixed, rng, drop_rate, drop
         keep[0] = True
         pri = np.diff(toa[keep])
 
+    # ---- läget vid fönstrets slut (formatet per tillstånd)
+    # sista behållna TOA har index t_last; det sista observerade intervallet täcker
+    # de rena intervallen fram till t_last - 1, så det är den rena pulsen som säger
+    # vilket besök som pågår och hur långt det kommit.
+    # OBS: signalen kan vara kortare än n_pulses när slumpade dwelltider blir korta
+    # (n_visits är en uppskattning), så längden tas ur den rena signalen, inte cfg.
+    n_ren = len(pri_clean)
+    t_last = int(np.flatnonzero(keep)[-1]) if keep is not None else n_ren
+    i_pulse = min(max(t_last - 1, 0), n_ren - 1)
+    if is_inf:
+        fas = dict(i_last=0, phase=0, lphase=0, last_level=float(cycle[0]), seen=int(i_pulse + 1))
+    else:
+        visit_of = np.repeat(np.arange(len(lv)), ln)[:n_ren]
+        starts = np.concatenate([[0], np.cumsum(ln)])[:len(lv)]
+        i_last = int(visit_of[i_pulse])
+        fas = dict(i_last=i_last, phase=phase, lphase=int(lphase),
+                   last_level=float(lv[i_last]), seen=int(i_pulse - starts[i_last] + 1))
+
+    if return_aux and cfg.post_format == "tillstand":
+        # cyc-målet för formatet per tillstånd: tillstånd j = besöket j steg före
+        # slutet, så pulsen i besök v har position (i_last - v) mod P, med P = antal
+        # S i posten. Gäller alla grenar (fast ordning, *, tvånivå); INF är position 0.
+        from .labels_tillstand import to_tokens as _tt
+        P = sum(1 for t in _tt(cycle.tolist(), list(lengths), order_fixed, length_fixed, fas)
+                if t == "S")
+        if is_inf:
+            cyc_clean = np.zeros(n_ren, dtype=np.int64)
+        else:
+            cyc_clean = ((fas["i_last"] - visit_of) % P).astype(np.int64)
     aux = _aux_targets(pri_clean, is_inf, keep, cyc_clean) if return_aux else None
-    return pri, start, aux
+    return pri, start, aux, fas
 
 
 # ------------------------------------------------------------------ API
@@ -384,12 +421,13 @@ def create_emitter_data(n_emitters, n_signals, drop_rate=0.0, noise_level=None,
         trip = [_make_signal(cycle, lengths, order_fixed, length_fixed,
                              sig_rng, drop_rate, drop_rng, return_aux=with_aux)
                 for _ in range(n_signals)]
-        seqs = [p for p, _, _ in trip]
+        seqs = [p for p, _, _, _ in trip]
         # start per signal: posten ankras vid fönstret, så facitet är per SIGNAL, inte
         # per emitter. data.label_to_tokens(label, i) tar signalens index.
-        label["start"] = [st for _, st, _ in trip]
+        label["start"] = [st for _, st, _, _ in trip]
+        label["fas"] = [f for _, _, _, f in trip]      # läget vid slutet, se _make_signal
         if with_aux:
-            label["aux"] = [a for _, _, a in trip]
+            label["aux"] = [a for _, _, a, _ in trip]
         out.append((seqs, label))
     return out
 

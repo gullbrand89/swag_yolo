@@ -32,7 +32,8 @@ from pathlib import Path
 _FORMFLAGGOR_AV_OM_SAKNAS = {"use_recur": False, "use_drop_flag": False,
                               "use_counter": True, "aux_count": False, "aux_cyc": False,
                               "use_visit": False, "use_seg_pos": False,
-                              "period_per_pulse": False}
+                              "period_per_pulse": False, "post_format": "gammal",
+                              "visit_from_end": False}
 
 
 def _lagg_pa_cfg(cfg, run_cfg):

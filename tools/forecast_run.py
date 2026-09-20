@@ -65,7 +65,16 @@ def main():
         rows = []
         for seqs, lab in data:
             pri = np.asarray(seqs[0], dtype=float)
-            tok_true = label_to_tokens(lab, 0)
+            if cfg.post_format == "tillstand":
+                # facitet ankras vid fönstrets slut -- alltså vid pulse n_obs, inte vid
+                # slutet av den längre signalen som generatorn gjorde
+                from transformer_post_generator.labels_tillstand import to_tokens, fas_for_prefix
+                assert a.drop == 0, "prediktionsfacit för formatet per tillstånd kräver ren signal"
+                fas = fas_for_prefix(pri, a.n_obs, lab["fas"][0])
+                tok_true = to_tokens(lab["levels"], lab["lengths"], lab["order_fixed"],
+                                     lab["length_fixed"], fas)
+            else:
+                tok_true = label_to_tokens(lab, 0)
             # observationen: de första n_obs INTERVALLEN. Med bortfall är antalet
             # intervall färre än pulser; vi tar det som finns upp till n_obs.
             rows.append((pri, pri[:a.n_obs], tok_true, lab["variant"]))

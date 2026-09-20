@@ -468,6 +468,71 @@ def _well_formed(row, EOS, PAD):
     return not bool((t[:cut] == PAD).any())
 
 
+# ------------------------------------------------------------------ 8
+def test_tillstand(n=300):
+    """
+    Formatet per tillstånd (labels_tillstand): posten är skriven bakåt från fönstrets
+    slut och ska stämma med de rena besöken -- tillstånd m mod P är besöket m steg
+    före slutet, SEEN är sista besökets längd. Rundtur parse -> tokens.
+    Prediktion ur posten ensam (tools.post_till_modell) ska vara exakt på ren signal.
+    """
+    from transformer_post_generator.labels_tillstand import parse, tokens_of, label_to_tokens
+    from transformer_post_generator.vocab import bin_of
+    from transformer_post_generator.all_emitters import GEN
+    print(f"\n8) formatet per tillstånd ({n} emittrar x 2 signaler)")
+
+    def visits(pri):
+        b = [bin_of(x) for x in pri]; out = []
+        for x in b:
+            if out and abs(out[-1][0] - x) <= cfg.run_tol_bins: out[-1][1] += 1
+            else: out.append([x, 1])
+        return out
+
+    def stammer(pri, tok):
+        d = parse(tok); st = d["states"]; P = len(st); vs = visits(pri)
+        if st[0][1][0] == "INF":
+            return len(vs) == 1
+        if d["seen"] != vs[-1][1]:
+            return False
+        for m in range(min(len(vs) - 1, 3 * P)):
+            comp, dw = st[m % P]; lvl, ln = vs[-1 - m]
+            if comp is not None and abs(d["bins"][comp] - lvl) > cfg.run_tol_bins: return False
+            if comp is None and not any(abs(b - lvl) <= cfg.run_tol_bins for b in d["bins"]): return False
+            if m > 0 and dw[0] == "D" and ln != dw[1]: return False
+            if m > 0 and dw[0] == "R" and not (dw[1] <= ln <= dw[2]): return False
+        return True
+
+    data = gen(n, 2)
+    toks = [(s_, label_to_tokens(l, i)) for seqs, l in data for i, s_ in enumerate(seqs)]
+    rt = sum(tokens_of(parse(t)) == t for _, t in toks)
+    check("rundtur parse -> tokens", rt == len(toks), f"{rt}/{len(toks)}")
+    ok = sum(stammer(np.asarray(s_, dtype=float), t) for s_, t in toks)
+    check("posten läst bakåt från slutet stämmer med signalen", ok == len(toks), f"{ok}/{len(toks)}")
+    check("längsta post ryms", max(len(t) for _, t in toks) + 2 <= cfg.max_tgt,
+          f"{max(len(t) for _, t in toks)} token")
+
+    # prediktion ur posten ensam: modellen ser 512, facit 128 framåt
+    from tools.post_till_modell import post_till_modell, rulla_ut_post
+    n0 = GEN.n_pulses
+    try:
+        GEN.n_pulses = n0 + 128
+        hel = tot = 0
+        for seqs, l in create_emitter_data(100, 1, 0.0, cfg.noise_level,
+                                           np.random.default_rng(5), only=["stagger", "ds_det_det"]):
+            pri = np.asarray(seqs[0], dtype=float)
+            vs = visits(pri[:n0]); f = l["fas"][0]
+            fas = dict(i_last=len(vs) - 1, phase=f["phase"], lphase=f["lphase"],
+                       last_level=float(pri[n0 - 1]), seen=vs[-1][1])
+            from transformer_post_generator.labels_tillstand import to_tokens as tt
+            tok = tt(l["levels"], l["lengths"], l["order_fixed"], l["length_fixed"], fas)
+            pred = rulla_ut_post(post_till_modell(tok), 128)
+            tot += 1
+            hel += pred is not None and bool(np.all(np.abs(np.asarray(pred) - pri[n0:n0 + 128]) <= 1.0))
+    finally:
+        GEN.n_pulses = n0
+    check("prediktion ur posten ensam, 128 pulser, ren signal", hel == tot, f"{hel}/{tot}")
+
+
 # ------------------------------------------------------------------
 if __name__ == "__main__":
     print(f"config: emitter={cfg.emitter}  model={cfg.model}  "
@@ -478,6 +543,8 @@ if __name__ == "__main__":
     test_canonical()
     test_binning()
     test_determinism()
+    if cfg.post_format == "tillstand":
+        test_tillstand()
     test_model()
     print("\n" + ("ALLT GRÖNT" if not FAIL else f"{len(FAIL)} FEL: " + ", ".join(FAIL)))
     sys.exit(1 if FAIL else 0)

@@ -170,6 +170,16 @@ def _nivaer_och_cykel(facit):
     if isinstance(facit, dict):
         cykel_us = list(facit["levels"])          # generatorns cykel, med upprepningar
         ordnad = bool(facit["order_fixed"])
+    elif "S" in facit:
+        # formatet per tillstånd: komponenterna i ordning är tillståndsföljden;
+        # ett * i något tillstånd betyder att ordningen inte är uppgiven
+        from transformer_post_generator.labels_tillstand import parse as parse_t
+        d = parse_t(list(facit))
+        st = d["states"]; P = len(st)
+        ordnad = all(c is not None for c, _ in st)
+        # posten är skriven bakåt i tiden; cykeln här ska gå framåt: 0, P-1, ..., 1
+        framat = [0] + list(range(P - 1, 0, -1))
+        cykel_us = [d["levels"][st[j][0]] for j in framat] if ordnad else d["levels"]
     else:
         d = parse(list(facit))
         ordnad = d["order_fixed"]
@@ -326,6 +336,7 @@ def emittermodell(r):
     en enda regel för alla varianter:
 
       period i nivåföljden  -> ett tillstånd per cykelposition, K_i = 1, lambda = cykeln
+                               (positioner med samma nivå OCH samma dwell slås ihop)
       period bara i dwellen -> ett tillstånd per DWELLposition, alla nivåer som
                                komponenter i varje, samma nivåmodell i alla
                                (ds_rand_det: ordningen slumpad, dwellcykeln fast)
@@ -355,22 +366,33 @@ def emittermodell(r):
             d["dwell_min"] = kant_max            # bara sett censurerat: minst så lång
         return d
 
+    # Ett tillstånd är en (komponent, dwellfördelning). Två cykelpositioner som är
+    # lika på båda är SAMMA tillstånd -- att det besöks två gånger per varv är
+    # lambdas sak. Positionerna slås därför ihop till unika tillstånd, och
+    # lambda_tillstand (position per besök) översätts till tillstånds-id.
     if th["period"] is not None:
-        tillstand = [dict(komponenter=[komp(niv, 1.0, c, w)]) for niv, c, w in th["cykel"]]
+        per_pos = [(("niva", niv, tuple(c), tuple(w)), dict(komponenter=[komp(niv, 1.0, c, w)]))
+                   for niv, c, w in th["cykel"]]
         grund, period = "niva", th["period"]
     elif th.get("period_dwell") is not None:
-        tillstand = [dict(komponenter=[komp(k, Phi["phi"][k], [d], [1.0])
-                                       for k in range(Phi["K"]) if Phi["n_pulser"][k] > 0])
-                     for d in th["dwell_cykel"]]
+        per_pos = [(("dwell", d), dict(komponenter=[komp(k, Phi["phi"][k], [d], [1.0])
+                                                   for k in range(Phi["K"]) if Phi["n_pulser"][k] > 0]))
+                   for d in th["dwell_cykel"]]
         grund, period = "dwell", th["period_dwell"]
     else:
         komps = [komp(k, Phi["phi"][k], th["c_stod"][k], th["w"][k])
                  for k in range(Phi["K"]) if Phi["n_pulser"][k] > 0]
-        tillstand = [dict(komponenter=komps)]
+        per_pos = [(("ingen",), dict(komponenter=komps))]
         grund, period = "ingen", None
 
-    return dict(N_s=len(tillstand), tillstand=tillstand,
-                **{"lambda": th["lambda_tillstand"]}, period=period, grund=grund)
+    ids, tillstand, pos_id = {}, [], []
+    for nyckel, t in per_pos:
+        if nyckel not in ids:
+            ids[nyckel] = len(tillstand); tillstand.append(t)
+        pos_id.append(ids[nyckel])
+    lam = [pos_id[p] if p >= 0 else -1 for p in th["lambda_tillstand"]]
+    return dict(N_s=len(tillstand), tillstand=tillstand, **{"lambda": lam},
+                period=period, grund=grund, cykel_id=pos_id)
 
 
 def bred_approximation(r, tillstand_i):
@@ -728,7 +750,10 @@ def sjalvtest(n=200, drop=0.0, seed=0, tol_bins=None, grind=None):
             samma = all(sorted(kk["niva"] for kk in t["komponenter"]) ==
                         sorted(kk["niva"] for kk in m["tillstand"][0]["komponenter"])
                         for t in m["tillstand"])
-            if m["N_s"] == sant_P and samma:
+            # lika dwell på två positioner är ett tillstånd: N_s = antal UNIKA
+            # dwellvärden i cykeln, medan lambdas period är sant_P
+            sant_Ns = len(set(int(x) for x in lab["lengths"][:sant_P]))
+            if m["N_s"] == sant_Ns and m["period"] == sant_P and samma:
                 dwp_ratt += 1
             elif len(dwp_fel) < 3:
                 dwp_fel.append((lab["variant"], lab["lengths"], m["N_s"], m["grund"]))

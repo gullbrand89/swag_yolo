@@ -1,0 +1,47 @@
+Speaker notes – auxiliary heads
+
+Six small linear layers on top of the encoder, each trained on a target the generator knows exactly. They're cheap (a few thousand parameters each) and the targets are free because the data is synthetic.
+
+Four are per pulse and are discarded after training. They exist only to force the encoder's representation to carry structure the decoder needs:
+
+new dwell – does a new dwell start at this pulse? (accuracy 0.98)
+position within the dwell – how many pulses into the current dwell (0.77)
+dropped pulses – how many pulses are missing in this interval, 0/1/2/3+ (0.81)
+cycle position – which state of the cycle this pulse belongs to (0.70; only defined for the first 64 dwells from the end)
+
+Two are per sequence, pooled over all pulses, and are used at inference:
+
+number of levels – K, read by the constrained decoder to end the level list (0.89)
+number of states – P, read to end the state list (0.78)
+
+The decoder cannot count as it generates, so anything that needs a count over the whole signal is computed here, in one pass, where the encoder sees everything.
+
+If asked "how do you know they help": the counting head took the level count from 0.68 to 0.95 without any other change; the four per-pulse heads were added together with the recur channel and not isolated, so I can't attribute a number to them alone. The state-count head is currently the bottleneck — 0.53–0.70 on the hard variants — and is the first thing on the future-work list.
+
+If asked "why not let the decoder learn it": we tried, three times, with different loss weights and more steps. Each time the field stayed flat. Transformers are bad at counting; giving the count as an input or a one-pass encoder target was what moved it.
+
+
+
+
+
+############################
+
+
+if someone asks if those things would be trivial since some of those are given as input?
+
+Good question to expect, because it's half right — and the half where it's right is worth admitting.
+
+On clean data, yes, two of them are near-trivial. "New dwell here?" is a level change between this pulse and the previous, and "position within the dwell" is the rl channel. The encoder has both as input. The heads there are not teaching it anything it can't read off; they're just cheap and harmless.
+
+Under dropout, none of them are trivial, and that's what they're for. The input channels are computed from the observed pulses, and every one of them is corrupted by a dropped pulse:
+
+a dropped pulse merges two intervals into one with a PRI that's the sum — rl resets, the level looks new, the dwell looks split;
+the true position within the dwell is the observed one plus the pulses that were dropped before it;
+"new dwell" has to distinguish a real level change from a merged interval that only looks like one;
+"dropped pulses" has no input at all — it's the head that says this interval is a merge, and it's the one your corrupt-PRI detector also computes.
+
+So the targets are the clean truth, the inputs are the observed signal, and the heads train the encoder to map one to the other. That's the whole point: they're the encoder's model of what dropout did to this window. Accuracy 0.77 on dwell position and 0.81 on dropped pulses at up to 25% dropout says it's learning something the inputs don't state.
+
+The two counting heads are never trivial. No input channel says how many levels there are or how long the cycle is; both are global over 512 pulses.
+
+Short version for the room: on clean data two of them would be trivial; we train with dropout, and there the inputs are wrong and the targets are the truth — that's the gap the heads close.

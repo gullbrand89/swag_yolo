@@ -42,11 +42,14 @@ _AUX_OK = "with_aux" in inspect.signature(create_emitter_data).parameters
 
 def label_to_tokens(label, i=0):
     """
-    Posten för signal i under etiketten. Facitet är per SIGNAL sedan ORDER-blocket
-    ankras vid fönstret (labels.to_tokens, start): label["start"][i] är fönstrets
-    första cykelposition. Saknas nyckeln (äldre generator) blir posten den
-    kanoniska, som förut.
+    Posten för signal i under etiketten. Facitet är per SIGNAL: med formatet per
+    tillstånd (cfg.post_format == "tillstand") ankras det vid fönstrets slut via
+    label["fas"][i]; med det gamla formatet vid fönstrets start via label["start"][i]
+    (saknas nyckeln blir posten den kanoniska, som förut).
     """
+    if cfg.post_format == "tillstand":
+        from .labels_tillstand import label_to_tokens as _lt
+        return _lt(label, i)
     start = label.get("start")
     st = None if start is None else start[i]
     return to_tokens(label["levels"], label["lengths"], label["order_fixed"],
@@ -118,21 +121,20 @@ def recur_lag(bins, rl):
 
 
 def n_levels_of(tokens):
-    """Antal nivåer i en post = antal nivånamn i LEVELS-blocket. Det är exakt det
-    antal avkodaren ska skriva, så det är målet för räknehuvudet -- inte
-    len(set(levels)), som skulle kunna skilja sig om två nivåer delade bin."""
-    n = 0
-    for t in tokens[1:]:
-        if t == "ORDER":
-            break
-        if t[0] == "L" and t[1:].isdigit():
-            n += 1
+    """Antal nivåer i posten: (L, B)-par efter LEVELS. Målet för räknehuvudet, av samma
+    skäl som räknevillkoret: avkodaren kan inte räkna, encodern kan i ett svep.
+    Formatoberoende -- paren läses tills något annat än ett L-namn följer."""
+    n, i = 0, 1
+    while i + 1 < len(tokens) and tokens[i].startswith("L") and tokens[i + 1].startswith("B"):
+        n += 1; i += 2
     return n
 
 
 def n_order_of(tokens):
-    """Cykelns längd P i posten = antal nivånamn i ORDER FIXED-blocket. None vid
-    RANDOM. Målet för periodhuvudet, av samma skäl som n_levels_of är räknemålet."""
+    """Periodhuvudets mål. Formatet per tillstånd: antal tillstånd (S-token), alltid
+    definierat. Gamla formatet: cykelns längd i ORDER FIXED, None vid RANDOM."""
+    if "S" in tokens:
+        return sum(1 for t in tokens if t == "S")
     i = tokens.index("ORDER") + 1
     if tokens[i] != "FIXED":
         return None
@@ -181,7 +183,12 @@ def make_channels(pri_obs, aux=None, n_levels=None, period=None):
     # cross-attention i stället för en räkning. Byggd på rl:s besöksgränser som recur.
     if cfg.use_visit:
         rl_v = rl if cfg.use_counter else run_length(bins, flags)
-        visit = np.minimum(np.cumsum(rl_v == 0) - 1, cfg.max_visit).astype(np.int64)
+        visit = np.cumsum(rl_v == 0) - 1
+        if cfg.visit_from_end:
+            # besök 0 = det som pågår när fönstret tar slut (ankringen i formatet
+            # per tillstånd); tillstånd j i posten = besök j från slutet, mod P
+            visit = visit[-1] - visit
+        visit = np.minimum(visit, cfg.max_visit).astype(np.int64)
     else:
         visit = np.zeros(len(bins), dtype=np.int64)
 

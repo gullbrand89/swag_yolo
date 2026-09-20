@@ -33,15 +33,24 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .config import cfg
-from .vocab import VOCAB, PAD, BOS, EOS, TOK2ID, LEVEL_NAMES, IS_BIN, BIN_START
+from .vocab import VOCAB, PAD, BOS, EOS, TOK2ID, LEVEL_NAMES, IS_BIN, IS_DUR, BIN_START
 
 _ORDER_ID = TOK2ID["ORDER"]
 _LEVELS_ID = TOK2ID["LEVELS"]
 _FIXED_ID = TOK2ID["FIXED"]
 _DWELL_ID = TOK2ID["DWELL"]
+_END_ID = TOK2ID["END"]
+_INF_ID = TOK2ID["INF"]
+# formatet per tillstånd (cfg.post_format): nivåblocket slutar med S i stället för
+# ORDER, och periodvillkoret räknar S i stället för namn i ORDER FIXED
+_TILLSTAND = cfg.post_format == "tillstand"
+_S_ID = TOK2ID["S"] if _TILLSTAND else None
+_SEEN_ID = TOK2ID["SEEN"] if _TILLSTAND else None
+_BLOCK_END_ID = _S_ID if _TILLSTAND else _ORDER_ID       # token som avslutar LEVELS-blocket
 # strukturtoken som börjar ett nytt segment i posten, se _seg_pos
 _SEG_START = torch.tensor([BOS] + [TOK2ID[t] for t in
-                          ("LEVELS", "ORDER", "FIXED", "RANDOM", "RANGE", "DWELL", "END")])
+                          ("LEVELS", "ORDER", "FIXED", "RANDOM", "RANGE", "DWELL", "END")
+                          + (("S", "SEEN") if _TILLSTAND else ())])
 
 
 def _seg_pos(tgt_in):
@@ -282,6 +291,8 @@ class Base(nn.Module):
             p_hat = AuxHeads.period_logits(aux_out, mask).argmax(-1).clamp(min=1)
         in_ofix = torch.zeros(B, dtype=torch.bool, device=dev)
         n_order = torch.zeros(B, dtype=torch.long, device=dev)
+        # formatet per tillstånd: antal S skrivna; villkoret ligger i _state_constraint
+        n_S = torch.zeros(B, dtype=torch.long, device=dev)
 
         for _ in range(steps):
             prev = ys[:, -1]
@@ -292,7 +303,10 @@ class Base(nn.Module):
                 logits = self._level_constraint(logits, prev, in_levels, last_bin,
                                                 is_bin, present, k_hat, n_names, kluster)
             if p_hat is not None:
-                logits = self._period_constraint(logits, prev, in_ofix, n_order, p_hat)
+                if _TILLSTAND:
+                    logits = self._state_constraint(logits, prev, in_levels, n_S, p_hat)
+                else:
+                    logits = self._period_constraint(logits, prev, in_ofix, n_order, p_hat)
             if greedy:
                 nxt = logits.argmax(-1)
             else:
@@ -309,7 +323,9 @@ class Base(nn.Module):
             last_bin = torch.where(wrote_bin, nxt, last_bin)
             is_name = (nxt >= _LVL_LO) & (nxt <= _LVL_HI)
             n_names = n_names + (is_name & in_levels).long()
-            in_levels &= nxt != _ORDER_ID
+            in_levels &= nxt != _BLOCK_END_ID
+            if _TILLSTAND:
+                n_S = n_S + (nxt == _S_ID).long()
             # ORDER FIXED öppnar blocket, DWELL stänger det; namnen däremellan räknas
             in_ofix |= (prev == _ORDER_ID) & (nxt == _FIXED_ID)
             n_order = n_order + (is_name & in_ofix).long()
@@ -317,6 +333,29 @@ class Base(nn.Module):
             if done.all():
                 break
         return ys
+
+    @staticmethod
+    def _state_constraint(logits, prev, in_levels, n_S, p_hat):
+        """
+        Formatet per tillstånd: antalet tillstånd styrs av periodhuvudet. Efter ett
+        avslutat tillstånd (prev är ett D-token eller INF, utanför nivåblocket) spärras
+        SEEN och END så länge färre än p_hat S skrivits, och S spärras när p_hat är
+        nått. Efter INF spärras aldrig END: INF är alltid ensamt tillstånd.
+        Efter "RANGE D5" är prev också ett D-token; att S/SEEN/END spärras där är
+        harmlöst, nästa token måste ändå vara ett D. Rent avkodningsvillkor.
+        """
+        V = logits.size(-1)
+        ids = torch.arange(V, device=logits.device)
+        is_dur = IS_DUR.to(logits.device)
+        prev_ok = ~in_levels & (is_dur[prev] | (prev == _INF_ID))
+        if not bool(prev_ok.any()):
+            return logits
+        forts = prev_ok & (n_S < p_hat) & (prev != _INF_ID)
+        stanna = prev_ok & (n_S >= p_hat)
+        slut = (ids[None, :] == _SEEN_ID) | (ids[None, :] == _END_ID)
+        logits = logits.masked_fill(forts[:, None] & slut, -1e30)
+        logits = logits.masked_fill(stanna[:, None] & (ids[None, :] == _S_ID), -1e30)
+        return logits
 
     @staticmethod
     def _period_constraint(logits, prev, in_ofix, n_order, p_hat):
@@ -460,9 +499,13 @@ class Base(nn.Module):
                 room = rest.any(-1)
                 # fortsätt: färre namn än k_hat OCH något att fortsätta med -> ORDER bort
                 forts = prev_is_bin & (n_names < k_hat) & room
-                # stanna: k_hat nått -> namnen bort, ORDER blir kvar
-                stanna = prev_is_bin & (n_names >= k_hat)
-                logits = logits.masked_fill(forts[:, None] & (ids[None, :] == _ORDER_ID), -1e30)
+                # stanna: k_hat nått -> namnen bort, ORDER (eller S) blir kvar.
+                # ...eller INGEN tillåten bin kvar: då får inget nytt namn skrivas, för
+                # binnen efter det skulle bli en upprepning av den senaste (räknehuvudet
+                # sa en nivå för mycket). 40 av 1000 poster på 20260920_141955 var
+                # oparsbara av just det skälet ("nivåbins inte strikt stigande").
+                stanna = prev_is_bin & ((n_names >= k_hat) | ~room)
+                logits = logits.masked_fill(forts[:, None] & (ids[None, :] == _BLOCK_END_ID), -1e30)
                 logits = logits.masked_fill(stanna[:, None] & is_name[None, :], -1e30)
 
         # ---- efter ett nivånamn: nästa är en bin, strikt över den senaste

@@ -11,6 +11,11 @@ from .vocab import (IS_NUM, LEVEL_NAMES, PAD, RANGE_HI, RANGE_LO, SIGMA, TOK2ID,
 
 _ORDER, _DWELL, _END = TOK2ID["ORDER"], TOK2ID["DWELL"], TOK2ID["END"]
 _TYPE = torch.tensor([TOK2ID["FIXED"], TOK2ID["RANDOM"], TOK2ID["RANGE"]])
+# formatet per tillstånd: typvalen är RANGE/INF/* (dwellens sort, komponentens sort)
+_TILLSTAND = cfg.post_format == "tillstand"
+if _TILLSTAND:
+    _S = TOK2ID["S"]
+    _TYPE_T = torch.tensor([TOK2ID["RANGE"], TOK2ID["INF"], TOK2ID["*"]])
 _LVL0, _LVL1 = TOK2ID[LEVEL_NAMES[0]], TOK2ID[LEVEL_NAMES[-1]]
 
 
@@ -75,6 +80,15 @@ def field_masks(tgt):
     dev = tgt.device
     isnum = IS_NUM.to(dev)[tgt] & valid
     is_lvl = (tgt >= _LVL0) & (tgt <= _LVL1)
+    if _TILLSTAND:
+        # formatet per tillstånd: num = B/D (bins, dwell, SEEN), type = RANGE/INF/*,
+        # order = nivånamnen som komponenter (efter första S), grammar = resten
+        # (LEVELS, nivånamnen i ordlistan, S, SEEN, END)
+        in_states = torch.cumsum((tgt == _S).long(), 1) > 0
+        typ = valid & torch.isin(tgt, _TYPE_T.to(dev))
+        order = valid & in_states & is_lvl
+        grammar = valid & ~isnum & ~typ & ~order
+        return isnum, typ, order, grammar
     # inne i ORDER-blocket: efter ORDER, före DWELL/END (kumulativt per rad)
     after_order = torch.cumsum((tgt == _ORDER).long(), 1) > 0
     before_end = torch.cumsum(((tgt == _DWELL) | (tgt == _END)).long(), 1) == 0

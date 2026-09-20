@@ -105,11 +105,23 @@ def main():
         pri = np.asarray(post["pri"], dtype=float)
         n_obs = post["n_obs"]
         obs, sant = pri[:n_obs], pri[n_obs:n_obs + n_pred]
-        rad = dict(variant=post["variant"], n_levels=(post["tokens_true"].index("ORDER") - 1) // 2)
-        for namn, tok in (("modell", post["tokens_pred"]), ("orakel", post["tokens_true"])):
+        tt = post["tokens_true"]
+        rad = dict(variant=post["variant"],
+                   n_levels=(tt.index("S") if "S" in tt else tt.index("ORDER")) // 2)
+        vagar = [("modell", post["tokens_pred"], "signal"), ("orakel", tt, "signal")]
+        if "S" in tt:
+            # formatet per tillstånd: prediktion ur posten ENSAM, utan signalen
+            vagar += [("post", post["tokens_pred"], "post"), ("post_orakel", tt, "post")]
+        for namn, tok, vag in vagar:
             try:
-                r = till_bibliotek(obs, tok)
-                pred, metod = rulla_ut(r, n_pred)
+                if vag == "post":
+                    from tools.post_till_modell import post_till_modell, rulla_ut_post
+                    pred = rulla_ut_post(post_till_modell(tok), n_pred)
+                    pred = None if pred is None else np.asarray(pred, dtype=float)
+                    metod = "posten ensam" if pred is not None else "ej deterministisk"
+                else:
+                    r = till_bibliotek(obs, tok)
+                    pred, metod = rulla_ut(r, n_pred)
             except Exception as e:                       # oparsbar post etc.
                 pred, metod = None, f"fel: {type(e).__name__}"
             if pred is None:
@@ -131,7 +143,8 @@ def main():
     for v in sorted({r_["variant"] for r_ in rader}):
         rv = [r_ for r_ in rader if r_["variant"] == v]
         s = dict(n=len(rv), exact_post=float(np.mean([r_["exact_post"] for r_ in rv])))
-        for namn in ("modell", "orakel"):
+        vagar_namn = [k for k in ("modell", "orakel", "post", "post_orakel") if k in rv[0]]
+        for namn in vagar_namn:
             inom = np.array([r_[namn]["inom"] for r_ in rv], dtype=float)   # (n, n_pred)
             s[namn] = dict(
                 hel_horisont=float(np.mean([r_[namn]["helt"] for r_ in rv])),
@@ -144,7 +157,7 @@ def main():
             s[namn]["metoder"] = {k: int(x) for k, x in s[namn]["metoder"].items()}
         summ[v] = s
         print(f"\n{v}  (n={s['n']}, post exact {s['exact_post']:.3f})")
-        for namn in ("modell", "orakel"):
+        for namn in vagar_namn:
             m = s[namn]
             print(f"  {namn:<7} hel horisont {m['hel_horisont']:.3f}   inom {a.tol_us} µs vid h=1/16/{n_pred}: "
                   f"{m['inom_h1']:.3f}/{m['inom_h16']:.3f}/{m['inom_h128']:.3f}   "
@@ -161,8 +174,11 @@ def main():
     fig, axes = plt.subplots(1, len(varianter), figsize=(5.2 * len(varianter), 3.6), squeeze=False)
     h = np.arange(1, n_pred + 1)
     for ax, v in zip(axes[0], varianter):
-        ax.plot(h, summ[v]["modell"]["inom_per_h"], color="#2A6FDB", lw=2, label="modellens post")
-        ax.plot(h, summ[v]["orakel"]["inom_per_h"], color="#999999", lw=1.5, ls="--", label="facitpost (orakel)")
+        ax.plot(h, summ[v]["modell"]["inom_per_h"], color="#2A6FDB", lw=2, label="modellens post + signal")
+        ax.plot(h, summ[v]["orakel"]["inom_per_h"], color="#999999", lw=1.5, ls="--", label="facitpost + signal")
+        if "post" in summ[v]:
+            ax.plot(h, summ[v]["post"]["inom_per_h"], color="#D6453D", lw=2, label="modellens post ENSAM")
+            ax.plot(h, summ[v]["post_orakel"]["inom_per_h"], color="#E8B4B0", lw=1.5, ls="--", label="facitpost ensam")
         ax.set_ylim(0, 1.02); ax.set_xlabel("pulser framåt"); ax.set_title(v)
         ax.set_ylabel(f"andel inom {a.tol_us:g} µs"); ax.grid(alpha=0.3); ax.legend(loc="lower left")
     fig.suptitle("Prediktion ur emittermodellen: andel signaler med rätt PRI per horisont", y=1.02)

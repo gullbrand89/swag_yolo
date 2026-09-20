@@ -43,6 +43,13 @@ import numpy as np
 
 
 def _order_block(tokens):
+    if "S" in tokens:
+        # formatet per tillstånd: komponenterna i ordning (None = *)
+        try:
+            from transformer_post_generator.labels_tillstand import parse as parse_t
+            return tuple(c for c, _ in parse_t(tokens)["states"])
+        except Exception:
+            return None
     if "ORDER" not in tokens:
         return None
     i = tokens.index("ORDER") + 1

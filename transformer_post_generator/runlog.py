@@ -10,7 +10,52 @@ from .vocab import ids_to_tokens
 from .labels import parse
 
 
+def _levels_pr(p_levels, t_levels, tol_us):
+    tl, pl = list(t_levels), list(p_levels)
+    hit = 0
+    for x in tl:
+        if not pl: break
+        j = min(range(len(pl)), key=lambda k: abs(pl[k] - x))
+        if abs(pl[j] - x) <= tol_us:
+            hit += 1; pl.pop(j)
+    return hit / max(1, len(p_levels)), hit / max(1, len(tl))
+
+
+def compare_tillstand(pred, true, tol_us=2.0):
+    """
+    Mått på formatet per tillstånd. exact är här det som räknas: teckenidentisk post
+    = identisk emittermodell (tools.post_till_modell). Resten lokaliserar felet:
+      n_levels_ok, level_precision/recall   nivåordlistan
+      n_states_ok      antal tillstånd (S) rätt
+      states_ok        andel tillstånd (komponent OCH dwell) rätt, givet rätt antal
+      comp_ok          andel komponenter rätt, givet rätt antal
+      dwell_ok         andel dwell rätt, givet rätt antal
+      seen_ok          SEEN rätt (1 om ingen SEEN i facit)
+    """
+    from .labels_tillstand import parse as parse_t
+    m = dict(exact=float(pred == true), parsed=0.0)
+    try:
+        p, t = parse_t(pred), parse_t(true)
+    except Exception:
+        return m
+    m["parsed"] = 1.0
+    m["n_levels_ok"] = float(len(p["levels"]) == len(t["levels"]))
+    m["level_precision"], m["level_recall"] = _levels_pr(p["levels"], t["levels"], tol_us)
+    ps, ts = p["states"], t["states"]
+    m["n_states_ok"] = float(len(ps) == len(ts))
+    if len(ps) == len(ts):
+        m["states_ok"] = float(np.mean([a == b for a, b in zip(ps, ts)]))
+        m["comp_ok"] = float(np.mean([a[0] == b[0] for a, b in zip(ps, ts)]))
+        m["dwell_ok"] = float(np.mean([a[1] == b[1] for a, b in zip(ps, ts)]))
+    else:
+        m["states_ok"] = m["comp_ok"] = m["dwell_ok"] = 0.0
+    m["seen_ok"] = float(p["seen"] == t["seen"])
+    return m
+
+
 def compare(pred, true, tol_us=2.0):
+    if cfg.post_format == "tillstand":
+        return compare_tillstand(pred, true, tol_us)
     m = dict(exact=float(pred == true), parsed=0.0)
     try:
         p, t = parse(pred), parse(true)

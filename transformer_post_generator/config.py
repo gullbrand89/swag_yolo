@@ -23,6 +23,15 @@ class Config:
     in_bins: int = 4096             # inputens binning, LINJÄR (inte log)
     toa_scale: float = 143.43        # µs per positionsenhet ~ korpusens medel-PRI
 
+    # ---------------- postens format
+    # "tillstand": S <komponent> <dwell> per tillstånd, ankrat vid fönstrets slut,
+    #              SEEN för det pågående tillståndet -- posten bär hela emittermodellen
+    #              (labels_tillstand, tools.post_till_modell). Det är målet: post ->
+    #              emittermodell utan att titta på signalen igen.
+    # "gammal":    LEVELS / ORDER / DWELL-blocken (labels). Kanonisk eller ankrad vid
+    #              fönstrets start. Kvar för jämförelse och för gamla checkpoints.
+    post_format: str = "tillstand"
+
     # ---------------- vokabulär
     max_levels: int = 32
     max_dur: int = 32             # största dwelltid i pulser. 1023 täcker allt när
@@ -70,6 +79,10 @@ class Config:
     # (lexikografiskt minsta) var inte inlärbar. Se data.make_channels.
     use_visit: bool = True
     max_visit: int = 64             # taket; ORDER behöver bara de första P <= 32 besöken
+    # ...räknat från fönstrets SLUT (formatet per tillstånd ankrar där): besök 0 är
+    # det som pågår när fönstret tar slut. Tillstånd j i posten = besök j från slutet
+    # (mod P), så uppslagningen blir densamma som förut, fast bakifrån.
+    visit_from_end: bool = True
 
     # ---------------- avkodning
     # Nivåblocket skrivs strikt stigande; efter ett nivånamn tillåts bara en bin
@@ -98,7 +111,7 @@ class Config:
     eval_n_emitters: int = 1000     # 200 gav ett standardfel på ~2.3 procentenheter på exact
     # Greedy kör annars max_tgt-1 = 255 steg. Längsta facit på 30000 emittrar är 89
     # token, och en enda rad som aldrig når EOS drar hela batchen till taket.
-    eval_max_new: int = 112
+    eval_max_new: int = 160         # formatet per tillstånd: längsta facit ~134 token
     eval_p_drops: tuple = (0.0, 0.05, 0.1, 0.2)
     eval_seed: int = 123
 

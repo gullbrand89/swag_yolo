@@ -22,6 +22,11 @@ from .config import cfg
 
 SPECIAL = ["<pad>", "<bos>", "<eos>"]
 STRUCT = ["LEVELS", "ORDER", "FIXED", "RANDOM", "RANGE", "DWELL", "INF", "END"]
+# formatet per tillstånd (labels_tillstand): S <komponent> <dwell> ... SEEN Dk END.
+# Läggs till bara när formatet är påslaget, så att checkpoints från det gamla
+# formatet fortfarande laddar (tools.reeval sätter cfg.post_format ur config.json).
+if cfg.post_format == "tillstand":
+    STRUCT = STRUCT + ["S", "*", "SEEN"]
 LEVEL_NAMES = [f"L{i}" for i in range(cfg.max_levels)]
 BIN = [f"B{i}" for i in range(cfg.n_bins)]
 DUR = [f"D{i}" for i in range(cfg.max_dur + 1)]

@@ -1,0 +1,157 @@
+Transformers for automatic emitter description from PRI sequences 
+
+Emil Gullbrandsson · September 2026 · summary of the exploration phase 
+
+1. Goal 
+
+The wider project aims to automate the creation of emitter descriptions from intercepted pulse trains. My task was to explore whether a transformer can do this end to end: read a sequence of pulse repetition intervals (PRI) and write a compact, structured description that can be converted into an emitter model. The emitter model is the same object as in the modelling slides: a set of components Φ (PRI levels), a set of states θ with a dwell time each, and a state sequence λ describing the order in which the states are visited. 
+
+The transformer is the natural candidate because the output has variable size (1–32 levels, 1–32 states, different dwell types), which a sequence-to-sequence decoder handles by simply writing as many state blocks as needed; because attention compares pulses at any distance, which periodic structure requires; and because a token output can be constrained by a grammar and inherits the tool set of language models (scratchpad reasoning, reinforcement learning). The success criterion is therefore not a loss value but: does the record, on its own, yield the correct emitter model? 
+
+2. Data, training and evaluation 
+
+All data is synthetic. A generator draws an emitter from seven families — static, jitter, stagger and four dwell-switch families ds_<order>_<dwell> where order and dwell are each deterministic or random — and emits a window of 512 pulses. Levels lie in 1–505 µs; dwell times are 1–32 pulses. Pulse dropout is applied at a rate drawn uniformly in 0–25 % per training example, so that a fraction of the observed intervals are sums of two or more true intervals. Every run trains from scratch on freshly generated data for 20 000 steps with batch 64 (AdamW, lr 3·10⁻⁴, warmup, weight decay 0.01), about two hours on a consumer GPU. 
+
+The target is a token record. The decoder is trained with teacher forcing: at every position it sees the correct previous tokens and predicts the next one, with cross-entropy weighted per field (level bins, dwell numbers, state type, grammar). Numeric tokens use a small ordinal smoothing (σ = 0.5 bin) so that a neighbouring bin is penalised less than a distant one. 
+
+Evaluation uses a fixed set of 1000 emitters, regenerated at dropout 0 %, 5 %, 10 % and 20 % with the same emitters at every level, and greedy decoding under the grammar. The headline metric is exact: the generated record is token-for-token identical to the reference, which with the final format means the emitter model is identical. Sub-metrics isolate where a record goes wrong: number of levels right, number of states right, components right and dwells right given the number of states, and the phase token right. A second, independent check rolls the emitter model forward and compares the predicted PRI of the next 128 pulses with the true continuation. 
+
+3. Iterative development: input channels and auxiliary tasks 
+
+The first models produced the level set well but could not write the order of states for fixed-order emitters (stagger 10 %, ds_det_det 24 % correct). Instead of training longer, each plateau was diagnosed with a small per-variant tool that reads the encoder's auxiliary predictions and the decoder's output separately, to tell whether the encoder lacks the information or the decoder fails to read it. The same pattern appeared three times: a field stayed flat regardless of loss weight, model size or steps, and the cause was always that the model had to count something — visits since a level was last seen, position in the cycle, position in the block it was writing. Attention is a lookup, not a counter. The fix each time was to provide the count as an input or as a one-pass encoder target: 
+
+Per-pulse input channels. Besides the quantised PRI bin and its continuous value, each pulse carries its time of arrival (used as rotary position), run length within its current level, recurrence (pulses since the same level was last seen) and visit index counted from the end of the window. Six channels in total. 
+
+Auxiliary heads on the encoder. Per-pulse heads predict new-level, cycle position and merged-interval flags; per-sequence heads predict the number of levels and the number of states (the period), the latter by majority vote over per-pulse logits. They are discarded at inference except that the count and period heads constrain decoding: the decoder cannot open more level or state blocks than the heads predict. 
+
+Anchoring and segment position. The record is anchored at the end of the window instead of at a canonical rotation, and the decoder receives its position within the current block as an embedding, so that writing state j is a lookup of visit j from the end rather than a count. 
+
+A baseline built without the transformer — an oracle detector of merged pulses followed by the same signal-based converter — reproduced the emitter model in 99 % of clean and 93 % of 20 %-dropout signals, against 90 % / 76 % for the transformer with the original record format. That measurement showed that the transformer's actual contribution was only the level set, and motivated the final change: a per-state record format in which the record carries the whole model and no second look at the signal is needed. 
+
+4. Model and record format 
+
+The model is a standard encoder–decoder transformer: d_model 256, 8 heads, 4 encoder and 4 decoder layers, feed-forward width 1024, dropout 0.1, QK normalisation in the encoder and rotary positional encoding driven by time of arrival — roughly 8 M parameters. The input is the sequence of pulses with the six channels above; the output vocabulary holds level names L0–L31, level bins B0–B2047, dwell values D1–D32 and a handful of structural tokens. 
+
+A record reads, for example: LEVELS L0 B482 L1 B613 L2 B1210  S L2 D3  S L0 D1  S L2 D3  S L1 D7  SEEN D2  END. The LEVELS block lists the components in ascending PRI. Each S block is one state: a component (or * for any level, i.e. random order) and a dwell — fixed Dk, uniform RANGE Da Db, or INF for a static emitter. States are written backwards in time from the end of the window, one minimal period, and SEEN gives how many pulses of the current state have been observed. Converting to the emitter model is a pure rewrite: N_s is the number of distinct (component, dwell) pairs, λ is the sequence of state ids over the period read forward, and the remaining dwell of the current state is D_0 − SEEN. Identical states at different cycle positions are merged and share an id in λ. 
+
+5. Results 
+
+Final run with the per-state format, 20 000 steps, 1000 evaluation emitters: 
+
+Metric 
+
+clean 
+
+20 % dropout 
+
+exact — record token-identical = emitter model identical, from the record alone 
+
+55.6 % 
+
+34.1 % 
+
+number of levels right 
+
+92.2 % 
+
+86.4 % 
+
+number of states right 
+
+82.6 % 
+
+73.8 % 
+
+components right / dwells right (given number of states) 
+
+75.9 / 73.3 % 
+
+65.9 / 53.6 % 
+
+phase token (SEEN) right 
+
+97.7 % 
+
+74.7 % 
+
+emitter model identical using record + signal (reference converter) 
+
+87.0 % 
+
+75.2 % 
+
+baseline: oracle detector + converter, no transformer 
+
+99.2 % 
+
+93.3 % 
+
+Table 1. Main evaluation metrics, run 20260920_141955. 
+
+Emitter family 
+
+exact, clean 
+
+exact, 20 % dropout 
+
+static 
+
+1.00 
+
+1.00 
+
+jitter 
+
+0.83 
+
+0.62 
+
+ds_rand_rand (random order, random dwell) 
+
+0.74 
+
+0.21 
+
+ds_det_rand (fixed order, random dwell) 
+
+0.38 
+
+0.08 
+
+ds_rand_det (random order, fixed dwell cycle) 
+
+0.37 
+
+0.23 
+
+stagger 
+
+0.26 
+
+0.12 
+
+ds_det_det (fixed order, fixed dwell) 
+
+0.25 
+
+0.11 
+
+Table 2. Exact per emitter family, 200 emitters each. 
+
+Prediction of the next 128 pulses (stagger / ds_det_det, clean): from the model's record plus the signal 82.7 / 77.3 % of signals are right over the whole horizon; from the model's record alone 32.7 / 26.7 %; from the reference record alone 100 / 100 %, confirming that the format carries everything needed. A follow-up experiment on stagger and ds_det_det only, with the level and dwell ranges reduced, reached exact around 0.70 clean and 0.45 at the highest dropout level with the number of levels right in over 90 % of records, indicating that the remaining errors are about scale rather than a missing mechanism. 
+
+Discussion 
+
+The strengths and weaknesses follow directly from Table 2. Families whose record is short and needs no counting (static, jitter, random order with random dwell) are solved or nearly so. The hard families are those with a fixed cycle: there the bottleneck is the number of states — the period head is right in only 53–70 % of the hard cases — and after that the dwell values. Dropout hurts twice: a merged interval shifts the observed visit index that the record is anchored on, and a dropped short dwell can remove a state from the observation altogether, which no method can recover. The signal-based path (record + signal) is therefore still ahead of the record alone, but the gap is where the transformer must improve, not where a detector should take over. 
+
+Two lessons are worth carrying forward. First, every improvement came from a diagnosis of what the model could not compute rather than from more training, and the recurring answer was to turn a count into a lookup. Second, the choice of output format matters as much as the architecture: only with the per-state format is the transformer's output the deliverable, and only then does exact measure what the project needs. 
+
+6. Next steps 
+
+Scratchpad before the record. Let the decoder first write the observed sequence of dwells as a transcript, then the states — supervised at first, then refined with reinforcement learning against the verifiable reward that the record reproduces the signal (the DeepSeek-R1 recipe). This attacks the period and dwell errors directly. 
+
+Baseline with the real detector. Replace the oracle in the baseline with the existing corrupt-pulse detector, on the same 1000 signals and the same metric, to fix the reference point. 
+
+Dropout-aware anchoring. Let the visit channel count a merged interval as the visits it hides, so that the record's anchor does not drift with dropout; and evaluate prediction on signals with dropout in the observed window. 
+
+Noise and scale. Add PRI jitter and a σ token per level, then grow model and batch on the A100 (bf16, batch 256) once the mechanism is settled. 
